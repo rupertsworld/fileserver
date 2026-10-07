@@ -96,8 +96,14 @@ export function defineParsersConformance(factory: FileServerConformanceFactory):
       assert.equal(unsupported.headers.get("accept-patch"), acceptPatch, path);
     }
     const described = await fetch(`${running.baseUrl}/editable.md?json`);
+    assert.equal(described.headers.get("allow"), writableMethods);
     assert.equal(described.headers.get("accept-patch"), mergePatchType);
-    assert.equal((await fetch(`${running.baseUrl}/plain.txt?json`)).headers.get("accept-patch"), null);
+    const plainDescription = await fetch(`${running.baseUrl}/plain.txt?json`);
+    assert.equal(plainDescription.headers.get("allow"), readOnlyMethods);
+    assert.equal(plainDescription.headers.get("accept-patch"), null);
+    const rootListing = await fetch(`${running.baseUrl}/?json`);
+    assert.equal(rootListing.headers.get("allow"), readOnlyMethods);
+    assert.equal(rootListing.headers.get("accept-patch"), null);
     for (const [path, method] of [
       ["/editable.md?json", "DELETE"],
       ["/plain.txt?json", "PUT"],
@@ -142,6 +148,7 @@ export function defineParsersConformance(factory: FileServerConformanceFactory):
     });
     assert.equal(patched.status, 200);
     assert.equal(patched.headers.get("content-type"), "application/json; charset=utf-8");
+    assert.equal(patched.headers.get("allow"), writableMethods);
     assert.equal(patched.headers.get("accept-patch"), mergePatchType);
     assert.deepEqual(await event, { type: "modified", path: "notes/existing.md" });
     const patchedWire = await patched.text();
@@ -206,6 +213,8 @@ export function defineParsersConformance(factory: FileServerConformanceFactory):
     });
     assert.equal(created.status, 201);
     assert.equal(created.headers.get("content-type"), "application/json; charset=utf-8");
+    assert.equal(created.headers.get("allow"), writableMethods);
+    assert.equal(created.headers.get("accept-patch"), mergePatchType);
     assert.deepEqual(await event, { type: "created", path: "notes/new.md" });
     assert.deepEqual((await created.json() as { frontmatter: unknown; body: unknown }), {
       path: "notes/new.md", kind: "file", contentType: "text/markdown; charset=utf-8",
@@ -236,6 +245,11 @@ export function defineParsersConformance(factory: FileServerConformanceFactory):
     });
     const socket = await openSocket(running.baseUrl, "/");
     context.after(() => socket.close());
+    const emptyInvalid = await fetch(`${running.baseUrl}/invalid.md?json`, {
+      method: "PATCH", headers: { "content-type": mergePatchType }, body: "{}",
+    });
+    assert.equal(emptyInvalid.status, 200);
+    assert.equal(typeof (await emptyInvalid.json() as { parseError: unknown }).parseError, "string");
     const cases: Array<{ method: "PUT" | "PATCH"; path?: string; contentType?: string; body: string; status: number }> = [
       { method: "PUT", contentType: mergePatchType, body: "{}", status: 415 },
       { method: "PATCH", contentType: "application/json", body: "{}", status: 415 },
@@ -282,7 +296,7 @@ export function defineParsersConformance(factory: FileServerConformanceFactory):
     });
     assert.equal(tooLargeBody.status, 413);
     const tooLargeTarget = await fetch(`${running.baseUrl}/large.md?json`, {
-      method: "PATCH", headers: { "content-type": mergePatchType }, body: '{"body":"new"}',
+      method: "PATCH", headers: { "content-type": mergePatchType }, body: "{",
     });
     assert.equal(tooLargeTarget.status, 415);
     const tooLargeOutput = await fetch(`${running.baseUrl}/almost.md?json`, {

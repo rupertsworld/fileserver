@@ -15,13 +15,12 @@ import { IgnorePatterns } from "./ignore.ts";
 import * as markdown from "./parsers/markdown.ts";
 
 const supportedMethods = new Set(["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"]);
-const allowedMethods = [...supportedMethods].join(", ");
+const byteAllowedMethods = "GET, HEAD, PUT, DELETE, OPTIONS";
 const allowedRequestHeaders = "Content-Type, Range, If-None-Match, If-Modified-Since, If-Range";
 const exposedResponseHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch, Link";
-const editContentType = "application/vnd.telepath.edit+json";
 const mergePatchContentType = "application/merge-patch+json";
 const jsonContentType = "application/json; charset=utf-8";
-const maximumEditBytes = 16_777_216;
+const maximumStructuredBytes = 16_777_216;
 const defaultFileKeys = new Set(["path", "kind", "contentType", "size", "modified"]);
 const readOnlyJsonMethods = "GET, HEAD, OPTIONS";
 const writableJsonMethods = "GET, HEAD, PUT, PATCH, OPTIONS";
@@ -92,7 +91,6 @@ type InspectedPath = {
   stats?: Stats;
 };
 type ByteRange = { kind: "range"; start: number; end: number } | { kind: "unsatisfiable" } | { kind: "full" };
-type EditDocument = { old_string: string; new_string: string; replace_all: boolean };
 type PendingWatcherEvent = { event: FileChangeEvent; timer: ReturnType<typeof setTimeout> };
 type SuppressedWatcherEvent = {
   event: FileChangeEvent;
@@ -326,7 +324,7 @@ export class FileServer {
     const writableJson = wantsJson && !parsed.trailingSlash
       && (inspected.missing || inspected.stats?.isFile() === true)
       && parser?.patch !== undefined;
-    const methods = wantsJson ? (writableJson ? writableJsonMethods : readOnlyJsonMethods) : allowedMethods;
+    const methods = wantsJson ? (writableJson ? writableJsonMethods : readOnlyJsonMethods) : byteAllowedMethods;
 
     // An exact link has one safe representation. All other requests must be
     // refused before method dispatch, including OPTIONS and unknown methods.
@@ -346,10 +344,15 @@ export class FileServer {
       sendError(request, response, 405, "method not allowed");
       return;
     }
-    if (request.method === "OPTIONS") { sendOptions(response, request, methods, wantsJson); return; }
+    if (request.method === "OPTIONS") { sendOptions(response, request, methods); return; }
 
     await ensureConfined(root, inspected.deepestExistingPath);
     if (this.temporaryPaths.has(inspected.absolutePath)) { sendError(request, response, 404, "not found"); return; }
+    if (!wantsJson && request.method === "PATCH") {
+      response.set("Allow", byteAllowedMethods);
+      sendError(request, response, 405, "method not allowed");
+      return;
+    }
     if (wantsJson && (request.method === "DELETE" || ((request.method === "PUT" || request.method === "PATCH") && !writableJson))) {
       sendError(request, response, 405, "method not allowed");
       return;
@@ -359,7 +362,6 @@ export class FileServer {
     if (wantsJson && request.method === "PUT") { await this.putJson(request, response, parsed, inspected, parser as FileParser); return; }
     if (wantsJson && request.method === "PATCH") { await this.patchJson(request, response, parsed, inspected, parser as FileParser); return; }
     if (request.method === "PUT") { await this.put(request, response, parsed, inspected); return; }
-    if (request.method === "PATCH") { await this.patch(request, response, parsed, inspected); return; }
     if (request.method === "DELETE") { await this.delete(request, response, parsed, inspected); return; }
     if (inspected.missing || inspected.stats === undefined) {
       sendError(request, response, 404, "not found");
@@ -466,7 +468,7 @@ export class FileServer {
     if (document === undefined) return;
     const changes = Object.fromEntries(Object.entries(document).filter(([key]) => !defaultFileKeys.has(key)));
     const bytes = await patchBytes(parser, { path: parsed.path, changes });
-    if (bytes.length > maximumEditBytes) { sendError(request, response, 413, "result is too large"); return; }
+    if (bytes.length > maximumStructuredBytes) { sendError(request, response, 413, "result is too large"); return; }
     const fields = await parseFields(parser, parsed.path, bytes);
     if (Object.hasOwn(fields, "parseError")) throw new HttpError(500, "parser could not read its output");
     const written = await this.replacePath(inspected.absolutePath, inspected.stats, parsed.path, Readable.from([bytes]), createOnly);
@@ -479,7 +481,7 @@ export class FileServer {
   private async patchJson(request: Request, response: Response, parsed: ParsedPath, inspected: InspectedPath, parser: FileParser): Promise<void> {
     if (inspected.missing || inspected.stats === undefined) { sendError(request, response, 404, "not found"); return; }
     if (!inspected.stats.isFile()) { sendError(request, response, 409, "cannot edit a directory"); return; }
-    if (inspected.stats.size > maximumEditBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
+    if (inspected.stats.size > maximumStructuredBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
     const changes = await this.readStructuredBody(request, response, mergePatchContentType);
     if (changes === undefined) return;
     if (Object.keys(changes).some((key) => defaultFileKeys.has(key))) {
@@ -495,14 +497,14 @@ export class FileServer {
     let sourceBytes: Buffer;
     try {
       stats = await handle.stat();
-      if (stats.size > maximumEditBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
-      sourceBytes = await readHandleAtMost(handle, maximumEditBytes + 1);
-      if (sourceBytes.length > maximumEditBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
+      if (stats.size > maximumStructuredBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
+      sourceBytes = await readHandleAtMost(handle, maximumStructuredBytes + 1);
+      if (sourceBytes.length > maximumStructuredBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
     } finally {
       await handle.close().catch(() => undefined);
     }
     const bytes = await patchBytes(parser, { path: parsed.path, bytes: sourceBytes, changes });
-    if (bytes.length > maximumEditBytes) { sendError(request, response, 413, "result is too large"); return; }
+    if (bytes.length > maximumStructuredBytes) { sendError(request, response, 413, "result is too large"); return; }
     const fields = await parseFields(parser, parsed.path, bytes);
     if (Object.hasOwn(fields, "parseError")) throw new HttpError(500, "parser could not read its output");
     const writtenStats = await writeAtomically(inspected.absolutePath, Readable.from([bytes]),
@@ -518,11 +520,11 @@ export class FileServer {
       sendError(request, response, 415, "unsupported media type"); return undefined;
     }
     const declaredLength = request.headers["content-length"];
-    if (typeof declaredLength === "string" && Number(declaredLength) > maximumEditBytes) {
+    if (typeof declaredLength === "string" && Number(declaredLength) > maximumStructuredBytes) {
       rejectOversizedRequestBody(request, response); return undefined;
     }
     let body: Buffer;
-    try { body = await readLimitedBody(request, maximumEditBytes); }
+    try { body = await readLimitedBody(request, maximumStructuredBytes); }
     catch (error) {
       if (error instanceof HttpError && error.status === 413) { rejectOversizedRequestBody(request, response); return undefined; }
       throw error;
@@ -532,70 +534,6 @@ export class FileServer {
     catch { sendError(request, response, 400, "malformed JSON body"); return undefined; }
     if (!isJsonObject(value)) { sendError(request, response, 400, "JSON body must be an object"); return undefined; }
     return value as Record<string, JsonValue>;
-  }
-
-  private async patch(request: Request, response: Response, parsed: ParsedPath, inspected: InspectedPath): Promise<void> {
-    if (parsed.trailingSlash) { sendError(request, response, 409, "cannot edit a directory path"); return; }
-    if (inspected.missing || inspected.stats === undefined) { sendError(request, response, 404, "not found"); return; }
-    if (inspected.stats.isDirectory()) { sendError(request, response, 409, "cannot edit a directory"); return; }
-    if (!isEditContentType(request.get("Content-Type")) || request.headers["content-encoding"] !== undefined) {
-      sendError(request, response, 415, "unsupported media type"); return;
-    }
-
-    const declaredLength = request.headers["content-length"];
-    if (typeof declaredLength === "string" && Number(declaredLength) > maximumEditBytes) {
-      rejectOversizedRequestBody(request, response); return;
-    }
-    let body: Buffer;
-    try { body = await readLimitedBody(request, maximumEditBytes); }
-    catch (error) {
-      if (error instanceof HttpError && error.status === 413) { rejectOversizedRequestBody(request, response); return; }
-      throw error;
-    }
-    const document = parseEditDocument(body);
-    if (document === undefined) { sendError(request, response, 400, "malformed edit document"); return; }
-
-    const handle = await open(inspected.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
-    let targetStats: Stats;
-    let sourceBytes: Buffer;
-    try {
-      targetStats = await handle.stat();
-      if (targetStats.isDirectory()) { sendError(request, response, 409, "cannot edit a directory"); return; }
-      if (!targetStats.isFile()) { sendError(request, response, 404, "not found"); return; }
-      if (targetStats.size > maximumEditBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
-      sourceBytes = await readHandleAtMost(handle, maximumEditBytes + 1);
-      if (sourceBytes.length > maximumEditBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
-    } finally {
-      await handle.close().catch(() => undefined);
-    }
-    let source: string;
-    try { source = utf8Decoder.decode(sourceBytes); }
-    catch { sendError(request, response, 415, "target is not valid UTF-8"); return; }
-
-    if (document.old_string.length === 0) { sendError(request, response, 422, "old_string is empty"); return; }
-    const matches = countLiteralMatches(source, document.old_string);
-    if (matches.count === 0) { sendError(request, response, 422, "old_string was not found"); return; }
-    if (matches.count > 1 && !document.replace_all) { sendError(request, response, 409, "old_string is ambiguous"); return; }
-
-    const replacements = document.replace_all ? matches.count : 1;
-    const estimatedResultSize = sourceBytes.length
-      - replacements * Buffer.byteLength(document.old_string)
-      + replacements * Buffer.byteLength(document.new_string);
-    if (estimatedResultSize > maximumEditBytes) { sendError(request, response, 413, "edit result is too large"); return; }
-    const result = document.replace_all
-      ? source.replaceAll(document.old_string, document.new_string)
-      : source.slice(0, matches.first) + document.new_string + source.slice(matches.first + document.old_string.length);
-    const resultBytes = Buffer.from(result);
-    if (resultBytes.length > maximumEditBytes) { sendError(request, response, 413, "edit result is too large"); return; }
-    await writeAtomically(
-      inspected.absolutePath,
-      Readable.from(resultBytes),
-      targetStats.mode & 0o7777,
-      targetStats.mtime.getTime(),
-      this.temporaryPaths,
-    );
-    await this.publishMutation({ type: "modified", path: parsed.path }, inspected.absolutePath);
-    response.status(204).end();
   }
 
   private async delete(request: Request, response: Response, parsed: ParsedPath, inspected: InspectedPath): Promise<void> {
@@ -1557,11 +1495,6 @@ function isParserJsonValue(value: unknown, visited = new Set<object>()): value i
   return valid;
 }
 
-function isEditContentType(contentType: string | undefined): boolean {
-  if (contentType === undefined) return false;
-  return /^application\/vnd\.telepath\.edit\+json\s*(?:;\s*charset\s*=\s*utf-8\s*)?$/i.test(contentType);
-}
-
 async function readLimitedBody(request: Request, maximumBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -1611,38 +1544,6 @@ async function readHandleAtMost(handle: FileHandle, maximumBytes: number): Promi
   return Buffer.concat(chunks, size);
 }
 
-function parseEditDocument(body: Buffer): EditDocument | undefined {
-  let value: unknown;
-  try { value = JSON.parse(utf8Decoder.decode(body)); }
-  catch { return undefined; }
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const document = value as Record<string, unknown>;
-  const keys = Object.keys(document);
-  if (!Object.hasOwn(document, "old_string") || !Object.hasOwn(document, "new_string")) return undefined;
-  if (keys.some((key) => key !== "old_string" && key !== "new_string" && key !== "replace_all")) return undefined;
-  if (typeof document.old_string !== "string" || typeof document.new_string !== "string") return undefined;
-  if (Object.hasOwn(document, "replace_all") && typeof document.replace_all !== "boolean") return undefined;
-  return {
-    old_string: document.old_string,
-    new_string: document.new_string,
-    replace_all: document.replace_all === true,
-  };
-}
-
-function countLiteralMatches(source: string, oldString: string): { count: number; first: number } {
-  let count = 0;
-  let first = -1;
-  let offset = 0;
-  while (offset <= source.length - oldString.length) {
-    const match = source.indexOf(oldString, offset);
-    if (match === -1) break;
-    if (first === -1) first = match;
-    count += 1;
-    offset = match + oldString.length;
-  }
-  return { count, first };
-}
-
 function isSupportedMethod(method: string): boolean {
   return supportedMethods.has(method);
 }
@@ -1674,7 +1575,7 @@ function sendConnectError(socket: Duplex, status: number, message: string): void
   const body = Buffer.from(JSON.stringify({ error: message }));
   const headers = [
     `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? "Error"}`,
-    ...(status === 405 ? [`Allow: ${allowedMethods}`] : []),
+    ...(status === 405 ? [`Allow: ${byteAllowedMethods}`] : []),
     "Access-Control-Allow-Origin: *",
     `Access-Control-Expose-Headers: ${exposedResponseHeaders}`,
     `Content-Type: ${jsonContentType}`,
@@ -1722,14 +1623,13 @@ async function sendUpgradeError(socket: Duplex, status: number, message: string)
   });
 }
 
-function sendOptions(response: Response, request: Request, methods: string, wantsJson: boolean): void {
+function sendOptions(response: Response, request: Request, methods: string): void {
   response.set({
     "Access-Control-Allow-Methods": methods,
     "Access-Control-Allow-Headers": allowedRequestHeaders,
     "Access-Control-Max-Age": "86400",
   });
   response.set("Allow", methods);
-  if (!wantsJson) response.set("Accept-Patch", editContentType);
   if (request.get("Access-Control-Request-Private-Network") === "true") {
     response.set("Access-Control-Allow-Private-Network", "true");
   }
@@ -1752,7 +1652,6 @@ function mapError(error: unknown): HttpError {
 
 function sendError(request: Request, response: Response, status: number, message: string): void {
   const body = Buffer.from(JSON.stringify({ error: message }));
-  if (status === 415 && !hasJsonQuery(request.url)) response.set("Accept-Patch", editContentType);
   response.set({ "Content-Type": jsonContentType, "Content-Length": String(body.length) });
   response.status(status);
   if (request.method === "HEAD") response.end();

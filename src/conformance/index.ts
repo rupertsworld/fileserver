@@ -2,7 +2,6 @@ import { defineChangesConformance } from "./changes.ts";
 import { defineConfinementConformance } from "./confinement.ts";
 import { defineCorsConformance } from "./cors.ts";
 import { defineDirectoriesConformance } from "./directories.ts";
-import { defineEditingConformance } from "./editing.ts";
 import { defineErrorsConformance } from "./errors.ts";
 import { defineParsersConformance } from "./parsers.ts";
 import { defineReadingConformance } from "./reading.ts";
@@ -23,7 +22,6 @@ export function defineFileServerConformance(factory: FileServerConformanceFactor
   defineParsersConformance(factory);
   defineDirectoriesConformance(factory);
   defineWritingConformance(factory);
-  defineEditingConformance(factory);
   defineConfinementConformance(factory);
   defineErrorsConformance(factory);
   defineCorsConformance(factory);

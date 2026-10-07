@@ -204,19 +204,6 @@ export async function waitForNoTemporaryFiles(root: string, permanentNames: read
   assert.fail("temporary file was not removed");
 }
 
-export async function editRequest(
-  baseUrl: string,
-  path: string,
-  document: unknown,
-  contentType = "application/vnd.telepath.edit+json",
-): Promise<RawResponse> {
-  const body = Buffer.from(JSON.stringify(document));
-  return rawRequest(baseUrl, "PATCH", path, {
-    "content-type": contentType,
-    "content-length": String(body.length),
-  }, body);
-}
-
 export async function refusedStatus(baseUrl: string, path: string): Promise<number> {
   const socket = new WebSocket(`${baseUrl.replace(/^http/, "ws")}${path}`);
   return new Promise((resolve, reject) => {

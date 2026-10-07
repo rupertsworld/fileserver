@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { parseRawResponse, rawRequest, rawTcpRequest, startFixture } from "./helpers.ts";
 import type { FileServerConformanceFactory } from "./types.js";
 
-const allowedMethods = "GET, HEAD, PUT, PATCH, DELETE, OPTIONS";
+const allowedMethods = "GET, HEAD, PUT, DELETE, OPTIONS";
 const exposedHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch, Link";
 
 export function defineErrorsConformance(factory: FileServerConformanceFactory): void {
@@ -66,31 +66,12 @@ export function defineErrorsConformance(factory: FileServerConformanceFactory): 
     }
 
     const errorResponses = [
-      await fetch(`${running.baseUrl}/file.txt`, {
-        method: "PATCH",
-        headers: { "content-type": "application/vnd.telepath.edit+json" },
-        body: "{",
-      }),
       await fetch(`${running.baseUrl}/missing`),
       await fetch(`${running.baseUrl}/link.txt`),
       await fetch(`${running.baseUrl}/dir`, { method: "PUT", body: "body" }),
-      await fetch(`${running.baseUrl}/file.txt`, { method: "PATCH", headers: { "content-type": "application/json" }, body: "{}" }),
-      await fetch(`${running.baseUrl}/file.txt`, {
-        method: "PATCH",
-        headers: { "content-type": "application/vnd.telepath.edit+json" },
-        body: JSON.stringify({ old_string: "missing", new_string: "new" }),
-      }),
-      await fetch(`${running.baseUrl}/file.txt`, {
-        method: "PATCH",
-        headers: { "content-type": "application/vnd.telepath.edit+json" },
-        body: JSON.stringify({
-          old_string: "same",
-          new_string: "x".repeat(9 * 1024 * 1024),
-          replace_all: true,
-        }),
-      }),
+      await fetch(`${running.baseUrl}/file.txt`, { method: "PATCH", body: "{}" }),
     ];
-    assert.deepEqual(errorResponses.map(({ status }) => status), [400, 404, 403, 409, 415, 422, 413]);
+    assert.deepEqual(errorResponses.map(({ status }) => status), [404, 403, 409, 405]);
     for (const response of errorResponses) {
       assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
       assert.equal(typeof (await response.json() as { error: unknown }).error, "string");
@@ -122,5 +103,27 @@ export function defineErrorsConformance(factory: FileServerConformanceFactory): 
       }
     }
     assert.equal((await fetch(`${running.baseUrl}/file.txt?JSON`, { method: "DELETE" })).status, 204);
+  });
+
+  test("file-server conformance: byte PATCH is 405 after path checks", async (context) => {
+    const running = await startFixture(context, factory, {
+      "file.txt": "old", "dir/child.txt": "child", ".hidden": "hidden",
+    });
+    await symlink("file.txt", join(running.root, "link.txt"));
+    for (const path of ["/file.txt", "/missing", "/dir", "/", "/file.txt?JSON"]) {
+      const response = await fetch(`${running.baseUrl}${path}`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: "{}",
+      });
+      assert.equal(response.status, 405, path);
+      assert.equal(response.headers.get("allow"), allowedMethods, path);
+      assert.equal(response.headers.get("accept-patch"), null, path);
+      assert.deepEqual(await response.json(), { error: "method not allowed" }, path);
+    }
+    for (const [path, status] of [["/.hidden", 404], ["/link.txt", 403], ["/bad%2Fpath", 400]] as const) {
+      const response = await fetch(`${running.baseUrl}${path}`, { method: "PATCH", body: "{}" });
+      assert.equal(response.status, status, path);
+      assert.equal(response.headers.get("accept-patch"), null, path);
+    }
+    assert.equal(await (await fetch(`${running.baseUrl}/file.txt`)).text(), "old");
   });
 }

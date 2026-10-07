@@ -80,6 +80,7 @@ async function stopCli(child: ChildProcessWithoutNullStreams, signal: NodeJS.Sig
 test("built CLI starts on port 0, round-trips every method, and exits cleanly on SIGTERM", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "file-server-cli-"));
   await writeFile(join(root, "hello.txt"), "round trip");
+  await writeFile(join(root, "note.md"), "Original\n");
   const { child, output, baseUrl } = await startCli([root, "--port", "0"]);
   context.after(async () => { await stopCli(child); await rm(root, { recursive: true, force: true }); });
 
@@ -92,7 +93,8 @@ test("built CLI starts on port 0, round-trips every method, and exits cleanly on
   assert.equal(await head.text(), "");
   const options = await fetch(`${baseUrl}/hello.txt`, { method: "OPTIONS" });
   assert.equal(options.status, 204);
-  assert.equal(options.headers.get("access-control-allow-methods"), "GET, HEAD, PUT, PATCH, DELETE, OPTIONS");
+  assert.equal(options.headers.get("access-control-allow-methods"), "GET, HEAD, PUT, DELETE, OPTIONS");
+  assert.equal(options.headers.get("accept-patch"), null);
   const socket = new WebSocket(`${baseUrl.replace(/^http/, "ws")}/`);
   await new Promise<void>((resolveOpen, reject) => {
     socket.once("open", resolveOpen);
@@ -110,13 +112,23 @@ test("built CLI starts on port 0, round-trips every method, and exits cleanly on
   assert.equal(put.status, 204);
   assert.deepEqual(await changed, { type: "modified", path: "hello.txt" });
   assert.equal(await (await fetch(`${baseUrl}/hello.txt`)).text(), "replacement");
-  const patch = await fetch(`${baseUrl}/hello.txt`, {
+  const refusedPatch = await fetch(`${baseUrl}/hello.txt`, {
     method: "PATCH",
-    headers: { "content-type": "application/vnd.telepath.edit+json" },
-    body: JSON.stringify({ old_string: "replace", new_string: "edit" }),
+    headers: { "content-type": "application/json" },
+    body: "{}",
   });
-  assert.equal(patch.status, 204);
-  assert.equal(await (await fetch(`${baseUrl}/hello.txt`)).text(), "editment");
+  assert.equal(refusedPatch.status, 405);
+  assert.equal(refusedPatch.headers.get("allow"), "GET, HEAD, PUT, DELETE, OPTIONS");
+  assert.equal(refusedPatch.headers.get("accept-patch"), null);
+  assert.equal(await (await fetch(`${baseUrl}/hello.txt`)).text(), "replacement");
+  const structuredPatch = await fetch(`${baseUrl}/note.md?json`, {
+    method: "PATCH",
+    headers: { "content-type": "application/merge-patch+json" },
+    body: JSON.stringify({ body: "Edited\n" }),
+  });
+  assert.equal(structuredPatch.status, 200);
+  assert.equal((await structuredPatch.json() as { body: string }).body, "Edited\n");
+  assert.equal(await (await fetch(`${baseUrl}/note.md`)).text(), "Edited\n");
   const deleted = await fetch(`${baseUrl}/hello.txt`, { method: "DELETE" });
   assert.equal(deleted.status, 204);
   assert.equal((await fetch(`${baseUrl}/hello.txt`)).status, 404);

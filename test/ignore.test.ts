@@ -23,7 +23,6 @@ import {
   type FileServerExtensionContext,
 } from "../src/server.ts";
 import {
-  editRequest,
   expectNoEvent,
   nextEvent,
   openSocket,
@@ -146,13 +145,10 @@ test("ignored files and directories are 404 for every method and are left untouc
 
   const hiddenPaths = ["/secret.txt", "/node_modules", "/node_modules/", "/node_modules/pkg/index.js", "/node_modules/pkg/new.js"];
   for (const path of hiddenPaths) {
-    for (const method of ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "POST"]) {
+    for (const method of ["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS", "POST"]) {
       const body = method === "PUT" ? Buffer.from("replaced") : undefined;
       assert.equal((await rawRequest(baseUrl, method, path, {}, body)).status, 404, `${method} ${path}`);
     }
-    const edit = await editRequest(baseUrl, path, { old_string: "e", new_string: "E", replace_all: true });
-    assert.equal(edit.status, 404, `PATCH ${path}`);
-    assert.deepEqual(JSON.parse(edit.body.toString()), { error: "not found" });
     const connect = parseRawResponse(await rawTcpRequest(
       baseUrl,
       `CONNECT ${path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n`,
@@ -163,8 +159,8 @@ test("ignored files and directories are 404 for every method and are left untouc
   assert.equal(await readFile(join(root, "secret.txt"), "utf8"), "secret");
   assert.equal(await readFile(join(root, "node_modules/pkg/index.js"), "utf8"), "module");
   await assert.rejects(stat(join(root, "node_modules/pkg/new.js")), { code: "ENOENT" });
-  // The same edit document succeeds on a visible file, so the 404s above come from hiding alone.
-  assert.equal((await editRequest(baseUrl, "/visible.txt", { old_string: "e", new_string: "E", replace_all: true })).status, 204);
+  // Hiding still takes precedence over the ordinary byte-PATCH 405.
+  assert.equal((await rawRequest(baseUrl, "PATCH", "/visible.txt")).status, 405);
 });
 
 test("an ignored path reached through a symbolic link is 404, because hiding precedes the link check", async () => {

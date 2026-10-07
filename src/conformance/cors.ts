@@ -17,18 +17,19 @@ export function defineCorsConformance(factory: FileServerConformanceFactory): vo
       assert.equal(response.status, 204);
       assert.equal(await response.text(), "");
       assert.equal(response.headers.get("access-control-allow-origin"), "*");
-      assert.equal(response.headers.get("access-control-allow-methods"), "GET, HEAD, PUT, PATCH, DELETE, OPTIONS");
+      assert.equal(response.headers.get("access-control-allow-methods"), "GET, HEAD, PUT, DELETE, OPTIONS");
       assert.equal(response.headers.get("access-control-allow-headers"), "Content-Type, Range, If-None-Match, If-Modified-Since, If-Range");
       assert.equal(response.headers.get("access-control-expose-headers"), exposedHeaders);
       assert.equal(response.headers.get("access-control-max-age"), "86400");
       assert.equal(response.headers.get("access-control-allow-private-network"), "true");
-      assert.equal(response.headers.get("accept-patch"), "application/vnd.telepath.edit+json");
+      assert.equal(response.headers.get("accept-patch"), null);
     }
     for (const [method, path] of [["GET", "/file.txt"], ["POST", "/file.txt"]] as const) {
       const response = await fetch(`${running.baseUrl}${path}`, { method });
       assert.equal(response.status, method === "GET" ? 200 : 405);
       assert.equal(response.headers.get("access-control-allow-origin"), "*");
       assert.equal(response.headers.get("access-control-expose-headers"), exposedHeaders);
+      assert.equal(response.headers.get("accept-patch"), null);
     }
     const missing = await fetch(`${running.baseUrl}/missing`);
     assert.equal(missing.status, 404);

@@ -37,9 +37,7 @@ export function defineChangesConformance(factory: FileServerConformanceFactory):
     assert.deepEqual(await event, { type: "modified", path: "scope/existing.txt" });
     event = nextEvent(socket);
     assert.equal((await fetch(`${running.baseUrl}/scope/existing.txt`, {
-      method: "PATCH",
-      headers: { "content-type": "application/vnd.telepath.edit+json" },
-      body: JSON.stringify({ old_string: "modified", new_string: "patched" }),
+      method: "PUT", body: "patched",
     })).status, 204);
     assert.deepEqual(await event, { type: "modified", path: "scope/existing.txt" });
     await expectNoEvent(socket);

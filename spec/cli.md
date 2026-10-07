@@ -83,7 +83,7 @@ silent fallback.
 On successful start:
 
 ```
-fileserver 0.2.0
+fileserver 0.3.0
 root:   /path/to/pictures
 url:    http://127.0.0.1:8765
 ```

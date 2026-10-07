@@ -1,7 +1,19 @@
 {
   "name": "@rupertsworld/fileserver",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Serve a live directory over HTTP and WebSocket.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rupertsworld/fileserver.git"
+  },
+  "homepage": "https://github.com/rupertsworld/fileserver#readme",
+  "bugs": {
+    "url": "https://github.com/rupertsworld/fileserver/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "fileserver": "dist/src/cli.js"
@@ -23,6 +35,7 @@
   "types": "dist/src/server.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "pretest": "npm run lint && npm run build",
     "test": "node --test test/*.test.ts",
     "lint": "tsc -p tsconfig.json --noEmit"

@@ -17,6 +17,7 @@ test("npm package ships the bundled skill, conformance suite, and Markdown parse
   const result = JSON.parse(stdout) as Array<{ files: Array<{ path: string }> }>;
   const files = new Set(result[0]?.files.map(({ path }) => path));
   assert(files.has("skill/SKILL.md"));
+  assert(files.has("LICENSE"));
   assert(files.has("dist/src/conformance/index.js"));
   assert(files.has("dist/src/conformance/index.d.ts"));
   assert(files.has("dist/src/parsers/markdown.js"));
@@ -26,7 +27,6 @@ test("npm package ships the bundled skill, conformance suite, and Markdown parse
     "confinement",
     "cors",
     "directories",
-    "editing",
     "errors",
     "helpers",
     "parsers",
@@ -75,6 +75,24 @@ test("bundled skill teaches descriptions, directory URLs, and live refetch", asy
   assert.match(skill, /`PUT <base>\/<path>\?json`/);
   assert.match(skill, /`PATCH <base>\/<path>\?json`/);
   assert.match(skill, /When an agent or artifact creates a file, send `If-None-Match: \*`/);
+  assert.match(skill, /npm install -g @rupertsworld\/fileserver/);
+  assert.match(skill, /`PATCH` without `\?json`.*`405`/s);
+  assert.match(skill, /whole-file `PUT`/);
+  assert.doesNotMatch(skill, /old_string|new_string/);
+});
+
+test("npm metadata identifies the MIT-licensed public source package", async () => {
+  const manifest = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as {
+    name?: string;
+    license?: string;
+    private?: boolean;
+    repository?: string | { url?: string };
+  };
+  assert.equal(manifest.name, "@rupertsworld/fileserver");
+  assert.equal(manifest.license, "MIT");
+  assert.notEqual(manifest.private, true);
+  const repository = typeof manifest.repository === "string" ? manifest.repository : manifest.repository?.url;
+  assert.match(repository ?? "", /github\.com[/:]rupertsworld\/fileserver(?:\.git)?$/);
 });
 
 test("published extension declarations include their Express type dependency", async () => {

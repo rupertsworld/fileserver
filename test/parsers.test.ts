@@ -56,7 +56,10 @@ test("read-only parsers describe files but cannot accept structured mutations", 
   const server = await startFileServer({ "item.ro": "original" }, {
     parsers: { ".ro": { parse: ({ bytes }: { bytes: Uint8Array }) => ({ value: new TextDecoder().decode(bytes) }) } },
   });
-  const description = await (await fetch(`${server.baseUrl}/item.ro?json`)).json() as Record<string, unknown>;
+  const descriptionResponse = await fetch(`${server.baseUrl}/item.ro?json`);
+  assert.equal(descriptionResponse.headers.get("allow"), "GET, HEAD, OPTIONS");
+  assert.equal(descriptionResponse.headers.get("accept-patch"), null);
+  const description = await descriptionResponse.json() as Record<string, unknown>;
   assert.equal(description.value, "original");
   const options = await fetch(`${server.baseUrl}/item.ro?json`, { method: "OPTIONS" });
   assert.equal(options.headers.get("allow"), "GET, HEAD, OPTIONS");
@@ -195,7 +198,8 @@ test("writable structured addresses advertise their methods and merge-patch medi
     assert.equal(options.headers.get("accept-patch"), null);
   }
   const byteOptions = await fetch(`${server.baseUrl}/note.md`, { method: "OPTIONS" });
-  assert.equal(byteOptions.headers.get("accept-patch"), "application/vnd.telepath.edit+json");
+  assert.equal(byteOptions.headers.get("access-control-allow-methods"), "GET, HEAD, PUT, DELETE, OPTIONS");
+  assert.equal(byteOptions.headers.get("accept-patch"), null);
 });
 
 test("structured writes validate media types, object bodies, and protected fields", async () => {

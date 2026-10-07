@@ -7,17 +7,23 @@ It is useful anywhere a browser page, script, or service needs a
 directory-shaped web surface without translating the files into another data
 model.
 
+The package is published on npm under the MIT licence.
+
 ## Install and run
 
-Node.js 24 or later. From the repository root:
+Requires Node.js 24 or later. Install the CLI from npm:
 
 ```sh
-npm install
-npm run build
-ln -s "$PWD/dist/src/cli.js" ~/.local/bin/fileserver   # or anywhere on your PATH
+npm install -g @rupertsworld/fileserver
 ```
 
-Check it works:
+To install the bundled consumer skill for an agent, run:
+
+```sh
+npx skills add rupertsworld/fileserver
+```
+
+Start a server and use the printed `url:`:
 
 ```sh
 fileserver /path/to/directory      # or no argument for the current directory
@@ -82,8 +88,8 @@ returns a `404` explaining how to request the listing. A directory URL
 without the slash redirects to it with `307`.
 
 `PUT` atomically creates or replaces any file and creates missing parents;
-`PATCH` without `?json` performs an anchored literal edit of a UTF-8 text
-file; `DELETE` removes a file or directory tree. Send `If-None-Match: *`
+`DELETE` removes a file or directory tree. `PATCH` on a file's own URL
+returns `405`; to change a file's bytes, `PUT` the whole file. Send `If-None-Match: *`
 when creating a file, with either form of `PUT`, to prevent replacement if
 the path already exists (`412`).
 
@@ -93,9 +99,9 @@ or `200`). `PATCH <file>?json` with `application/merge-patch+json` changes
 parsed fields of an existing file and returns the new description (`200`).
 Default description fields cannot be patched. Markdown `PATCH` merges
 `frontmatter` keys and can replace `body`; Markdown `PUT` builds the whole
-file from those fields. A writable `?json` address advertises
-`Allow: GET, HEAD, PUT, PATCH, OPTIONS` and
-`Accept-Patch: application/merge-patch+json`. Other `?json` addresses allow
+file from those fields. Every response from a writable `?json` address,
+including a successful read, carries `Allow: GET, HEAD, PUT, PATCH, OPTIONS`
+and `Accept-Patch: application/merge-patch+json`. Other `?json` addresses allow
 only `GET, HEAD, OPTIONS`; `DELETE ?json` always returns `405` after path
 checks. Structured request bodies and results are limited to 16 MiB.
 `OPTIONS` provides the CORS preflight response. See [`spec/`](spec/index.md) for the
@@ -115,6 +121,19 @@ an extension-to-parser map; by default `.md` uses the built-in parser,
 exported at `@rupertsworld/fileserver/parsers/markdown`. Supplying `{}`
 selects no parsers. The built `@rupertsworld/fileserver/conformance`
 subpath registers the base contract tests against another server factory.
+
+## Development
+
+From a clone of [the source repository](https://github.com/rupertsworld/fileserver),
+install dependencies and build the package:
+
+```sh
+npm install
+npm run build
+node dist/src/cli.js /path/to/directory
+```
+
+Run `npm test` before shipping changes.
 
 ## Confinement
 
