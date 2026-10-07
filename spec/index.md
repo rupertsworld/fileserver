@@ -29,12 +29,15 @@ the reverse.
 
 ## Distribution
 
-The npm package is `@rupertsworld/fileserver` and its CLI binary is
-`fileserver`. The package is built from this repository and is not published
-to a registry. It includes the consumer skill and exports the server, the
-built-in parser module and type, and extension types for embedding in
-another process (see [the API](server.md#api)). A wire change and the
-corresponding skill update land in one commit.
+The package is published to npm as `@rupertsworld/fileserver` under the
+MIT licence. Its source is at
+[github.com/rupertsworld/fileserver](https://github.com/rupertsworld/fileserver).
+The CLI binary is `fileserver`. The consumer skill is at `skill/SKILL.md` in
+both the repository and the package, where
+`npx skills add rupertsworld/fileserver` finds it. The package exports the server, the built-in parser module and
+type, and extension types for embedding in another process (see
+[the API](server.md#api)). A wire change and the corresponding skill update
+land in one commit.
 
 ## Approval boundary
 
@@ -90,10 +93,8 @@ and `chokidar` for filesystem changes.
   (`W/"<size>-<mtime>"`).
 - **Streaming.** `GET` responses serving file bytes stream from disk, with
   `Range` mapped to a start/end read; byte `PUT` bodies stream to the
-  temporary file. Buffered mutations include the
-  [anchored edit](server.md#editing)
-  and [structured writes](parsers.md#structured-writes), with the limits in
-  their wire contracts.
+  temporary file. [Structured writes](parsers.md#structured-writes) are
+  buffered, with the limits in their wire contract.
 - **Temporary files** have a collision-resistant name in the target
   directory, are excluded from listings and addressing, and are removed if
   the write fails.

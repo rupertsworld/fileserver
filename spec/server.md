@@ -28,7 +28,7 @@ the server does not watch them.
 selects its listing with `?json`; without `?json`, the slash-terminated URL
 serves `index.html` and the other redirects to it (see
 [Directories](#directories)). `GET` or `HEAD` on `/file/` is `404`.
-Without `?json`, `PUT` or `PATCH` to `/` or to any slash-terminated path is
+Without `?json`, `PUT` to `/` or to any slash-terminated path is
 `409 Conflict`. `DELETE` without `?json` accepts either spelling of a
 directory, except the root, which is `409`. Byte writes use the file
 address without `?json`; [Parsers](parsers.md#structured-writes) specifies
@@ -42,7 +42,6 @@ GET     /<path>?json   describe an item or list a directory
 HEAD    /<path>        the corresponding GET status and headers, without a body
 PUT     /<path>        write a whole file
 PUT     /<path>?json   create or replace a file from structured JSON
-PATCH   /<path>        replace an anchored span within a text file
 PATCH   /<path>?json   change parsed fields in an existing file
 DELETE  /<path>        remove a file or directory
 OPTIONS /<path>        CORS preflight
@@ -218,55 +217,6 @@ returning `204 No Content`, or `404 Not Found` if the path does not exist.
 `DELETE /` is `409 Conflict`; the root is configuration, not a deletable
 resource.
 
-## Editing
-
-`PATCH /<path>` without `?json` replaces an anchored span of a text file
-without resending it. The body is JSON sent as
-`Content-Type: application/vnd.telepath.edit+json` (matched
-case-insensitively; an optional `charset=utf-8` parameter is permitted):
-
-```json
-{ "old_string": "port = 8765", "new_string": "port = 0", "replace_all": false }
-```
-
-The body must be an object with exactly a string `old_string`, a string
-`new_string`, and an optional boolean `replace_all` (default false); any
-other shape — wrong types, extra keys, an array, `null` — is
-`400 Bad Request`. The names are the ones agent edit tools use, so an
-agent maps them without reading further.
-
-The file is decoded as UTF-8 and `old_string` is matched as a literal
-substring: no pattern syntax, no whitespace or line-ending normalisation;
-occurrences are counted non-overlapping from left to right, so `"aa"`
-occurs once in `"aaa"`. It must appear, and exactly once unless
-`replace_all` is true. The result is the decoded text with the
-replacement, re-encoded as UTF-8; nothing else in the file — a byte-order
-mark, CRLF endings — is touched. In an empty file every non-empty
-`old_string` is not found.
-
-Statuses, evaluated in this order after the path resolves: a missing file
-is `404 Not Found`; a directory is `409 Conflict`; a body with any other
-`Content-Type`, or with a `Content-Encoding`, is `415 Unsupported Media
-Type`; a body larger than 16 MiB (16,777,216 bytes) is `413 Content Too
-Large`; a malformed body is `400`; a target file larger than 16 MiB, or one
-that is not valid UTF-8, is `415` — binary or very large content is
-written by whole-file `PUT`; an empty `old_string` is `422 Unprocessable
-Content` (it anchors nothing); one not found is `422`; one that is
-ambiguous (more than one match, `replace_all` false) is `409`; a result
-that would exceed 16 MiB once re-encoded is `413` and nothing is written.
-Success is `204 No Content`, written atomically as for `PUT`. Every `415`
-and every `OPTIONS` response on a byte address carries
-`Accept-Patch: application/vnd.telepath.edit+json`.
-
-This is the anchored, must-be-unique contract a coding agent's edit tool
-uses, so its failure modes are ones an agent already understands. It is a
-`PATCH` because it is a partial modification of the resource, and `PATCH`
-carries no idempotency requirement — an edit that fails to re-match on a
-second application fits it. `PATCH` dispatches on the body's media type,
-so other patch documents can be added beside this one without changing it.
-[Structured patches](parsers.md#structured-writes) use `?json` and a
-different media type.
-
 ## Confinement
 
 Every path resolves beneath the root and cannot escape it. The root is
@@ -362,12 +312,13 @@ The [HTTP rules](index.md#http-conventions) apply.
 preflight for a byte address has these header values:
 
 ```
-Access-Control-Allow-Methods: GET, HEAD, PUT, PATCH, DELETE, OPTIONS
+Access-Control-Allow-Methods: GET, HEAD, PUT, DELETE, OPTIONS
 Access-Control-Allow-Headers: Content-Type, Range, If-None-Match, If-Modified-Since, If-Range
 Access-Control-Expose-Headers: ETag, Accept-Ranges, Content-Range, Accept-Patch, Link
 Access-Control-Max-Age: 86400
-Accept-Patch: application/vnd.telepath.edit+json
 ```
+
+Byte-address responses do not carry `Accept-Patch`.
 
 On a `?json` address, the [parser method rules](parsers.md#structured-writes)
 set `Allow`, `Access-Control-Allow-Methods`, and `Accept-Patch`; the other
@@ -379,15 +330,17 @@ a page can read the validators, range headers, and file-description link.
 ## Errors
 
 A method outside the set above is `405 Method Not Allowed`, whether or not
-the path exists, subject to the path checks below. Its byte-address response
-has `Allow: GET, HEAD, PUT, PATCH, DELETE, OPTIONS`; a `?json` response uses
-the [parser method list](parsers.md#structured-writes). Checks are applied
-in the order:
+the path exists, subject to the path checks below. A byte-address `405`
+response has `Allow: GET, HEAD, PUT, DELETE, OPTIONS`; a `?json` response
+uses the [parser method list](parsers.md#structured-writes). `PATCH` on a
+byte address also returns `405`; a client changes file bytes with a
+whole-file `PUT`. Checks are applied in this order:
 URL syntax (`400`); hidden segments (`404`); symbolic links (`403`) and
 special objects (`404`), except for the exact-link `GET` or `HEAD`
 description; unsupported method (`405`) or `OPTIONS` (`204` regardless of
-existence); confinement; [parser method eligibility](parsers.md#structured-writes)
-for `PUT`, `PATCH`, or `DELETE` with `?json` (`405`); the extension
+existence); confinement; byte `PATCH` (`405`) or
+[parser method eligibility](parsers.md#structured-writes) for `PUT`, `PATCH`,
+or `DELETE` with `?json` (`405`); the extension
 `handle` hook; resource type (`404`, `409`); then the operation's own
 validation. A missing path read with `?json` is `404`; a missing path
 patched at a writable `?json` address is also `404`. Structured `PUT` can
@@ -398,8 +351,8 @@ Filesystem failures map `ENOENT`/`ENOTDIR` to
 Every error response except to `HEAD` has a body: `application/json;
 charset=utf-8` in the [error shape](index.md#http-conventions), so
 a caller reads one shape whether the failure is a `404`, a `405`, or
-an edit's `422`. `HEAD` errors carry the same status and headers with
-no body; `204` and `304` responses have no body.
+a structured patch's `422`. `HEAD` errors carry the same status and headers
+with no body; `204` and `304` responses have no body.
 
 ## API
 
@@ -511,7 +464,7 @@ server awaits either form:
 
 - `handle(request, response, context): boolean | Promise<boolean>` runs after
   URL hygiene, confinement, common headers, method validation, `OPTIONS`,
-  and parser method eligibility, but before base parser and resource
+  the byte `PATCH` rejection, and parser method eligibility, but before base parser and resource
   dispatch. Structured `?json` mutations belong to parser modules, so
   `handle` delegates them. `request` and `response` are the Express
   request and response. It returns a boolean: `true` only after ending the

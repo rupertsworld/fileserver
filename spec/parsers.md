@@ -62,9 +62,8 @@ address.
 Symbolic links follow [Confinement](server.md#confinement).
 
 `OPTIONS` repeats the applicable `Allow` list in
-`Access-Control-Allow-Methods`. The byte address keeps its
-[editing media type](server.md#editing). Path and resource checks keep
-the [order](server.md#errors) specified by the server contract.
+`Access-Control-Allow-Methods`. [Errors](server.md#errors) specifies the
+methods a byte address allows and the order of path and resource checks.
 
 `PATCH <path>?json` takes `Content-Type: application/merge-patch+json`
 and a top-level JSON object. It applies

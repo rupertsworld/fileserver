@@ -20,8 +20,9 @@ The tests cover:
 - In-process, against temporary directories: URL mapping, ignore patterns,
   reading (media types, ranges, conditional requests, `HEAD`, `Link`, and
   `?json` descriptions), directory index files, redirects and listings,
-  writing, editing, confinement, change signals, CORS, errors, and the
-  extension hooks.
+  writing, `405` for `PATCH` on a byte address and its absence from that
+  address's `Allow`, preflight, and `Accept-Patch` headers, confinement,
+  change signals, CORS, errors, and the extension hooks.
 - Parser selection: `.md` mapped to built-in Markdown by default, a
   supplied map replacing that default, case-insensitive matching, rejection
   of invalid keys or keys that differ only by case, and read-only parsers;
@@ -50,7 +51,7 @@ The tests cover:
 
 Consumer-skill tests check that an agent or artifact creating a file is
 told to send `If-None-Match: *` and that the skill explains Markdown
-descriptions and structured writes.
+descriptions, structured writes, and whole-file `PUT` for byte changes.
 
 Four properties are stated as invariants and covered by targeted tests and
 review rather than proven black-box: a reader never observes a partially

@@ -14,8 +14,9 @@ writing a client.
 The skill covers:
 
 - **Starting.** Start `fileserver` when none is running and use its printed
-  `url:`; when the binary is missing, install the package built from this
-  repository, as described under [Distribution](index.md#distribution).
+  `url:`; when the binary is missing, install it with
+  `npm install -g @rupertsworld/fileserver`, as described under
+  [Distribution](index.md#distribution).
 - **Reading bytes.** A file is its bytes at its path with a real
   `Content-Type`, so it can be an `<img src>`, a link, or a `fetch`;
   `Range` permits partial reads and `ETag`/`If-None-Match` permits
@@ -62,12 +63,6 @@ The skill covers:
   `frontmatterError` on `PUT`. The skill covers the
   [writable parser and error rules](parsers.md#structured-writes),
   including `412` for `If-None-Match: *` when the file exists.
-- **Editing.** `PATCH` with `Content-Type: application/vnd.telepath.edit+json`
-  and `{ old_string, new_string, replace_all? }` — literal match, must be
-  unique unless `replace_all`, text files only; the failure modes to
-  handle: `422` not found or empty anchor, `409` ambiguous, `415` wrong
-  media type, not a text file, or a file too large to edit, `413` body or
-  result too large. Whole-file `PUT` for anything binary or large.
 - **Structured editing.** `PATCH <file>?json` with
   `application/merge-patch+json` changes parsed fields, returns the
   new description with `200`, and rejects a missing file with `404` or an
@@ -82,13 +77,13 @@ The skill covers:
   client may filter by path prefix only when its whole view depends on that
   subtree.
 - **Boundaries.** No authentication; only the `json` query parameter has a
-  meaning, and other parameters are ignored. After path checks, `DELETE`
-  with `?json` is `405`; deletion uses the byte address. Dot-prefixed paths,
-  paths matching configured ignore patterns, and anything above the served
-  directory are unreachable; except for create-only `PUT`, concurrent writers are
-  last-write-wins, so read before you edit. If an anchored edit returns
-  `422` because its match is gone, re-read before retrying; surface other
-  `422` errors.
+  meaning, and other parameters are ignored. The skill covers the
+  [method restrictions](server.md#errors) on `DELETE ?json` and byte
+  `PATCH`; deletions and whole-file changes use the byte address.
+  Dot-prefixed paths, paths matching configured
+  ignore patterns, and anything above the served directory are unreachable;
+  except for create-only `PUT`, concurrent writers are last-write-wins, so
+  read before changing a file.
 - **Errors.** Every error has the [HTTP error shape](index.md#http-conventions);
   surface it rather than swallowing it.
 
