@@ -39,7 +39,7 @@ test("npm package ships the bundled skill and built conformance subpath", async 
   assert.equal(typeof conformance.defineFileServerConformance, "function");
 });
 
-test("bundled skill teaches scheme mapping, dirty refetch, no replay, reconnection, and extension entries", async () => {
+test("bundled skill teaches descriptions, directory URLs, and live refetch", async () => {
   const skill = await readFile(join(process.cwd(), "skill/SKILL.md"), "utf8");
   assert.match(skill, /WebSocket/);
   assert.match(skill, /`http` or `https` scheme to\s+`ws` or `wss`/);
@@ -50,8 +50,16 @@ test("bundled skill teaches scheme mapping, dirty refetch, no replay, reconnecti
   assert.match(skill, /reconnect with backoff/);
   assert.match(skill, /Dot-prefixed paths/);
   assert.match(skill, /ignore\s+patterns/);
-  assert.match(skill, /unrecognized type/);
-  assert.match(skill, /Its `name` remains an addressable URL\s+component/);
+  assert.match(skill, /\?json/);
+  assert.match(skill, /`Link`/);
+  assert.match(skill, /`contentType`/);
+  assert.match(skill, /`kind`/);
+  assert.match(skill, /unrecognized `kind`/);
+  assert.match(skill, /full root-relative `path`/);
+  assert.match(skill, /index\.html/);
+  assert.match(skill, /307/);
+  assert.match(skill, /405/);
+  assert.match(skill, /Allow: GET, HEAD, OPTIONS/);
 });
 
 test("published extension declarations include their Express type dependency", async () => {

@@ -331,10 +331,10 @@ async function withCli(args: string[], env: NodeJS.ProcessEnv, check: (baseUrl: 
 }
 
 async function listedNames(baseUrl: string, path: string): Promise<string[]> {
-  const response = await fetch(`${baseUrl}${path}`);
+  const response = await fetch(`${baseUrl}${path}?json`);
   assert.equal(response.status, 200, path);
-  const listing = await response.json() as { entries: Array<{ name: string }> };
-  return listing.entries.map(({ name }) => name);
+  const listing = await response.json() as { entries: Array<{ path: string }> };
+  return listing.entries.map((entry) => entry.path.slice(entry.path.lastIndexOf("/") + 1));
 }
 
 async function rootWithFiles(files: Record<string, string>): Promise<string> {

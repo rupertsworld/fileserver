@@ -29,7 +29,27 @@ export function defineConfinementConformance(factory: FileServerConformanceFacto
     for (const method of ["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS", "POST"]) {
       assert.equal((await rawRequest(running.baseUrl, method, "/special.sock")).status, 404, method);
     }
-    const listing = await (await fetch(`${running.baseUrl}/`)).json() as { entries: Array<{ name: string }> };
-    assert.deepEqual(listing.entries.map(({ name }) => name), ["escape"]);
+    const listing = await (await fetch(`${running.baseUrl}/?json`)).json() as { entries: Array<{ path: string; kind: string }> };
+    assert.deepEqual(listing.entries, [{ path: "escape", kind: "symlink" }]);
+    let descriptionLength = 0;
+    for (const method of ["GET", "HEAD"]) {
+      const response = await fetch(`${running.baseUrl}/escape?json`, { method });
+      assert.equal(response.status, 200, method);
+      assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8", method);
+      assert.equal(response.headers.get("etag"), null, method);
+      assert.equal(response.headers.get("link"), null, method);
+      const body = method === "GET" ? await response.text() : "";
+      if (method === "GET") {
+        descriptionLength = Buffer.byteLength(body);
+        assert.deepEqual(JSON.parse(body), { path: "escape", kind: "symlink" });
+      } else assert.equal(body, "");
+      assert.equal(response.headers.get("content-length"), String(descriptionLength), method);
+    }
+    for (const path of ["/escape", "/escape/?json", "/escape/secret.txt?json"]) {
+      assert.equal((await fetch(`${running.baseUrl}${path}`)).status, 403, path);
+    }
+    for (const method of ["PUT", "PATCH", "DELETE", "OPTIONS", "POST"]) {
+      assert.equal((await fetch(`${running.baseUrl}/escape?json`, { method })).status, 403, method);
+    }
   });
 }

@@ -74,6 +74,39 @@ test("handle runs after path, object, method, and OPTIONS checks", async (contex
   assert.equal(calls, 0);
 });
 
+test("handle can inspect an exact symlink description and accept PATCH ?json", async (context) => {
+  const root = await makeRoot({ "note.txt": "note" });
+  await symlink("note.txt", join(root, "alias.txt"));
+  const seen: Array<FileServerExtensionContext["resource"]> = [];
+  const server = await new FileServer({
+    root,
+    extension: {
+      async handle(request, response, requestContext) {
+        if (requestContext.path === "alias.txt") {
+          seen.push(requestContext.resource);
+          assert.deepEqual(await requestContext.inspect("alias.txt"), { type: "symlink" });
+          return false;
+        }
+        if (request.method === "PATCH" && requestContext.path === "note.txt" && request.url.includes("?json")) {
+          response.status(204).end();
+          return true;
+        }
+        return false;
+      },
+    },
+  }).listen({ port: 0 });
+  context.after(() => server.close());
+
+  assert.deepEqual(await (await fetch(`${server.url}/alias.txt?json`)).json(), { path: "alias.txt", kind: "symlink" });
+  assert.equal((await fetch(`${server.url}/alias.txt?json`, { method: "HEAD" })).status, 200);
+  assert.deepEqual(seen, [{ type: "symlink" }, { type: "symlink" }]);
+  assert.equal((await fetch(`${server.url}/alias.txt?json`, { method: "PATCH" })).status, 403);
+  assert.equal((await fetch(`${server.url}/note.txt?json`, { method: "PATCH" })).status, 204);
+  const refused = await fetch(`${server.url}/note.txt?json`, { method: "DELETE" });
+  assert.equal(refused.status, 405);
+  assert.equal(refused.headers.get("allow"), "GET, HEAD, OPTIONS");
+});
+
 test("invalid handle completion and thrown failures become 500 responses", async (context) => {
   for (const extension of [
     { handle: () => true },
@@ -91,7 +124,21 @@ test("invalid handle completion and thrown failures become 500 responses", async
 test("listing can decorate a base listing and invalid listings become 500", async (context) => {
   let calls = 0;
   const extension: FileServerExtension = {
-    handle(_request, response, requestContext) {
+    handle(request, response, requestContext) {
+      if (requestContext.path === "file.txt" && request.url.includes("?json")) {
+        if (requestContext.resource.type !== "file") throw new Error("expected a file");
+        const body = Buffer.from(JSON.stringify({
+          path: "file.txt",
+          kind: "file",
+          contentType: "text/plain; charset=utf-8",
+          size: requestContext.resource.size,
+          modified: requestContext.resource.modified,
+          id: 7,
+        }));
+        response.set({ "Content-Type": "application/json; charset=utf-8", "Content-Length": String(body.length) });
+        response.end(body);
+        return true;
+      }
       if (requestContext.path !== "virtual") return false;
       response.type("text/plain").send("virtual resource");
       return true;
@@ -101,35 +148,39 @@ test("listing can decorate a base listing and invalid listings become 500", asyn
       assert.equal(requestContext.resource.type, "dir");
       return {
         ...listing,
-        entries: [...listing.entries, { name: "virtual", type: "record", id: 42 }],
+        entries: [
+          ...listing.entries.map((entry) => entry.kind === "file" ? { ...entry, id: 7 } : entry),
+          { path: "virtual", kind: "record", id: 42 },
+        ],
       };
     },
   };
   const server = await startExtended({ "file.txt": "file" }, extension);
   context.after(() => server.close());
-  const listing = await (await fetch(`${server.url}/`)).json() as DirectoryListing;
+  const listing = await (await fetch(`${server.url}/?json`)).json() as DirectoryListing;
   const virtualEntry = listing.entries.at(-1);
-  assert.deepEqual(virtualEntry, { name: "virtual", type: "record", id: 42 });
+  assert.deepEqual(listing.entries[0], await (await fetch(`${server.url}/file.txt?json`)).json());
+  assert.deepEqual(virtualEntry, { path: "virtual", kind: "record", id: 42 });
   assert(virtualEntry !== undefined);
-  const addressablePath = [listing.path, virtualEntry.name].filter(Boolean).map(encodeURIComponent).join("/");
+  const addressablePath = virtualEntry.path.split("/").map(encodeURIComponent).join("/");
   assert.equal(await (await fetch(`${server.url}/${addressablePath}`)).text(), "virtual resource");
-  const head = await fetch(`${server.url}/`, { method: "HEAD" });
+  const head = await fetch(`${server.url}/?json`, { method: "HEAD" });
   assert.equal(head.status, 200);
   assert.equal(calls, 2);
 
   const invalidEntries = [
-    { name: 1, type: "file" },
-    { name: "file", type: "file" },
-    { name: "file", type: "file", size: -1, modified: "2026-01-01T00:00:00.000Z" },
-    { name: "file", type: "file", size: 1, modified: "not-a-date" },
-    { name: "dir", type: "dir", extra: true },
-    { name: "link", type: "link", size: 1 },
-    { name: "bad\uD800", type: "record" },
+    { path: 1, kind: "file" },
+    { path: "file", kind: "file" },
+    { path: "file", kind: "file", size: -1, contentType: "text/plain", modified: "2026-01-01T00:00:00.000Z" },
+    { path: "file", kind: "file", size: 1, contentType: "text/plain", modified: "not-a-date" },
+    { path: "dir", kind: "dir", extra: true },
+    { path: "link", kind: "symlink", size: 1 },
+    { path: "bad\uD800", kind: "record" },
   ];
   for (const entry of invalidEntries) {
-    const invalid = await startExtended({}, { listing: () => ({ path: "", entries: [entry] }) as never });
+    const invalid = await startExtended({}, { listing: () => ({ path: "", kind: "dir", entries: [entry] }) as never });
     context.after(() => invalid.close());
-    const invalidResponse = await fetch(`${invalid.url}/`);
+    const invalidResponse = await fetch(`${invalid.url}/?json`);
     assert.equal(invalidResponse.status, 500, JSON.stringify(entry));
     assert.deepEqual(await invalidResponse.json(), { error: "internal server error" });
   }
@@ -140,11 +191,11 @@ test("listing hook exceptions retain context-operation status or map unexpected 
     listing: async (_request, _listing, requestContext) => requestContext.list("missing"),
   });
   context.after(() => missing.close());
-  assert.equal((await fetch(`${missing.url}/`)).status, 404);
+  assert.equal((await fetch(`${missing.url}/?json`)).status, 404);
 
   const unexpected = await startExtended({}, { listing: () => { throw new Error("boom"); } });
   context.after(() => unexpected.close());
-  assert.equal((await fetch(`${unexpected.url}/`)).status, 500);
+  assert.equal((await fetch(`${unexpected.url}/?json`)).status, 500);
 });
 
 test("filesystem-shaped errors thrown directly by extension hooks are 500", async (context) => {
@@ -157,7 +208,7 @@ test("filesystem-shaped errors thrown directly by extension hooks are 500", asyn
 
   const listingServer = await startExtended({}, { listing: () => { throw filesystemShapedError(); } });
   context.after(() => listingServer.close());
-  const listingResponse = await fetch(`${listingServer.url}/`);
+  const listingResponse = await fetch(`${listingServer.url}/?json`);
   assert.equal(listingResponse.status, 500);
   assert.deepEqual(await listingResponse.json(), { error: "internal server error" });
 });
@@ -196,7 +247,7 @@ test("context operations expose base inspection/listing and use base mutation si
   };
   assert.equal(result.inspected.type, "file");
   assert.deepEqual(result.missing, { type: "missing" });
-  assert.deepEqual(result.listing.entries.map(({ name }) => name), ["source.txt"]);
+  assert.deepEqual(result.listing.entries.map(({ path }) => path), ["source.txt"]);
   assert.equal(result.created, "created");
   assert.equal(result.replaced, "replaced");
   assert.equal(listingHookCalls, 0, "context.list does not recurse through the listing hook");
@@ -335,8 +386,8 @@ test("context.replace preserves the old file and cleans up after a failing strea
 
   assert.equal((await fetch(`${server.url}/replace-with-failure`)).status, 500);
   assert.equal(await (await fetch(`${server.url}/target.txt`)).text(), "old contents");
-  const listing = await (await fetch(`${server.url}/`)).json() as DirectoryListing;
-  assert.deepEqual(listing.entries.map(({ name }) => name), ["target.txt"]);
+  const listing = await (await fetch(`${server.url}/?json`)).json() as DirectoryListing;
+  assert.deepEqual(listing.entries.map(({ path }) => path), ["target.txt"]);
 });
 
 test("concurrent context replacements are atomic and last completed write wins", async (context) => {

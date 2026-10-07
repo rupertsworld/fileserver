@@ -29,13 +29,16 @@ export function defineReadingConformance(factory: FileServerConformanceFactory):
       assert.equal(full.headers.get("accept-ranges"), "bytes", name);
       assert.equal(full.headers.get("last-modified"), "Fri, 02 Jan 2026 03:04:05 GMT", name);
       assert.match(full.headers.get("etag") ?? "", /^W\//, name);
+      assert.equal(full.headers.get("link"), `<${name}?json>; rel="describedby"`, name);
       assert.equal(await full.text(), "0123456789", name);
       const ranged = await fetch(`${running.baseUrl}/${name}`, { headers: { range: "bytes=2-4" } });
       assert.equal(ranged.status, 206, name);
       assert.equal(ranged.headers.get("content-range"), "bytes 2-4/10", name);
+      assert.equal(ranged.headers.get("link"), `<${name}?json>; rel="describedby"`, name);
       assert.equal(await ranged.text(), "234", name);
       const cached = await fetch(`${running.baseUrl}/${name}`, { headers: { "if-none-match": full.headers.get("etag") as string } });
       assert.equal(cached.status, 304, name);
+      assert.equal(cached.headers.get("link"), `<${name}?json>; rel="describedby"`, name);
       const head = await fetch(`${running.baseUrl}/${name}`, { method: "HEAD", headers: { range: "bytes=2-4" } });
       assert.equal(head.status, 200, name);
       assert.equal(head.headers.get("content-type"), contentType, name);
@@ -43,6 +46,7 @@ export function defineReadingConformance(factory: FileServerConformanceFactory):
       assert.equal(head.headers.get("accept-ranges"), "bytes", name);
       assert.equal(head.headers.get("last-modified"), full.headers.get("last-modified"), name);
       assert.equal(head.headers.get("etag"), full.headers.get("etag"), name);
+      assert.equal(head.headers.get("link"), `<${name}?json>; rel="describedby"`, name);
       assert.equal(head.headers.get("content-range"), null, name);
       assert.equal(await head.text(), "", name);
     }
@@ -50,6 +54,66 @@ export function defineReadingConformance(factory: FileServerConformanceFactory):
     assert.equal((await fetch(`${running.baseUrl}/app.webmanifest`)).headers.get("content-type"), "application/manifest+json; charset=utf-8");
     assert.equal((await fetch(`${running.baseUrl}/photo.jpg`)).headers.get("content-type"), "image/jpeg");
     assert.equal((await fetch(`${running.baseUrl}/unknown.telepath-no-mime`)).headers.get("content-type"), "application/octet-stream");
+  });
+
+  test("file-server conformance: file descriptions select by the exact json parameter", async (context) => {
+    const running = await startFixture(context, factory, {
+      "notes/café #1.md": "coffee",
+      "photo.jpg": Uint8Array.from([0xff, 0xd8, 0xff]),
+      "unknown.telepath-no-mime": "bytes",
+    });
+    await utimes(join(running.root, "notes", "café #1.md"), new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+    const path = "/notes/caf%C3%A9%20%231.md";
+    const bytes = await fetch(`${running.baseUrl}${path}?JSON&other=1`);
+    assert.equal(bytes.status, 200);
+    assert.equal(bytes.headers.get("link"), '<caf%C3%A9%20%231.md?json>; rel="describedby"');
+    assert.equal(await bytes.text(), "coffee");
+
+    for (const query of ["?json", "?json=", "?json=0&other=1", "?other=1&json=yes"]) {
+      const response = await fetch(`${running.baseUrl}${path}${query}`, {
+        headers: {
+          "if-none-match": "*",
+          "if-modified-since": "Tue, 05 Mar 2030 00:00:00 GMT",
+          "if-range": "Fri, 02 Jan 2026 03:04:05 GMT",
+          range: "bytes=0-1",
+        },
+      });
+      assert.equal(response.status, 200, query);
+      assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8", query);
+      for (const header of ["etag", "last-modified", "accept-ranges", "content-range", "link"]) {
+        assert.equal(response.headers.get(header), null, `${query}: ${header}`);
+      }
+      const body = await response.text();
+      assert.equal(response.headers.get("content-length"), String(Buffer.byteLength(body)), query);
+      assert.deepEqual(JSON.parse(body), {
+        path: "notes/café #1.md",
+        kind: "file",
+        contentType: "text/markdown; charset=utf-8",
+        size: 6,
+        modified: "2026-01-02T03:04:05.000Z",
+      }, query);
+      const head = await fetch(`${running.baseUrl}${path}${query}`, { method: "HEAD", headers: { "if-none-match": "*", range: "bytes=0-1" } });
+      assert.equal(head.status, 200, query);
+      assert.equal(head.headers.get("content-length"), String(Buffer.byteLength(body)), query);
+      assert.equal(head.headers.get("content-type"), "application/json; charset=utf-8", query);
+      assert.equal(head.headers.get("etag"), null, query);
+      assert.equal(head.headers.get("link"), null, query);
+      assert.equal(await head.text(), "", query);
+    }
+    for (const [name, contentType, size] of [
+      ["photo.jpg", "image/jpeg", 3],
+      ["unknown.telepath-no-mime", "application/octet-stream", 5],
+    ] as const) {
+      const response = await fetch(`${running.baseUrl}/${name}?json`);
+      assert.equal(response.status, 200, name);
+      const description = await response.json() as Record<string, unknown>;
+      assert.equal(description.path, name);
+      assert.equal(description.kind, "file");
+      assert.equal(description.contentType, contentType);
+      assert.equal(description.size, size);
+      assert.match(String(description.modified), /^\d{4}-\d\d-\d\dT/);
+      assert.deepEqual(Object.keys(description).sort(), ["contentType", "kind", "modified", "path", "size"]);
+    }
   });
 
   test("file-server conformance: range and conditional edge cases", async (context) => {

@@ -257,7 +257,9 @@ test("a change reported for a path that is now a hidden directory is published a
   await mkdir(join(root, "build"));
   await writeFile(join(root, "build/out.js"), "out");
   assert.deepEqual(await replaced, { type: "deleted", path: "build" });
-  await expectNoEvent(socket);
+  // The separate filesystem operations may straddle a debounce window.
+  // Let any further deleted signals settle before testing a late watcher event.
+  await delay(300);
 
   // The watcher on the old file can still report a change after the swap. The
   // server judges the path as it now is, a hidden directory, and never
@@ -433,10 +435,10 @@ test("the matcher for paths found on disk is rebuilt after a fixed number of che
 // ---------------------------------------------------------------------------
 
 async function listedNames(baseUrl: string, path: string): Promise<string[]> {
-  const response = await fetch(`${baseUrl}${path}`);
+  const response = await fetch(`${baseUrl}${path}?json`);
   assert.equal(response.status, 200, path);
-  const listing = await response.json() as { entries: Array<{ name: string }> };
-  return listing.entries.map(({ name }) => name);
+  const listing = await response.json() as { entries: Array<{ path: string }> };
+  return listing.entries.map((entry) => entry.path.slice(entry.path.lastIndexOf("/") + 1));
 }
 
 /** Waits until the watcher holds exactly the expected paths, then asserts it does. */

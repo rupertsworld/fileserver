@@ -71,8 +71,8 @@ export function defineWritingConformance(factory: FileServerConformanceFactory):
     const upload = beginUpload(running.baseUrl, "/atomic.md", newBody.length);
     upload.request.write(newBody.subarray(0, 32 * 1024));
     const temporaryName = await waitForTemporaryName(running.root, ["atomic", "atomic.md"]);
-    const listing = await (await fetch(`${running.baseUrl}/`)).json() as { entries: Array<{ name: string }> };
-    assert.deepEqual(listing.entries.map(({ name }) => name), ["atomic", "atomic.md"]);
+    const listing = await (await fetch(`${running.baseUrl}/?json`)).json() as { entries: Array<{ path: string }> };
+    assert.deepEqual(listing.entries.map(({ path }) => path), ["atomic", "atomic.md"]);
     assert.equal((await fetch(`${running.baseUrl}/${encodeURIComponent(temporaryName)}`)).status, 404);
     assert.deepEqual(Buffer.from(await (await fetch(`${running.baseUrl}/atomic.md`)).arrayBuffer()), oldBody);
     await expectNoEvent(socket);

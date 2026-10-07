@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { rawRequest, startFixture } from "./helpers.ts";
 import type { FileServerConformanceFactory } from "./types.js";
 
-const exposedHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch";
+const exposedHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch, Link";
 
 export function defineCorsConformance(factory: FileServerConformanceFactory): void {
   test("file-server conformance: CORS headers and preflight", async (context) => {

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants, type Dirent, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, realpath, rename, rm, stat, unlink, utimes, type FileHandle } from "node:fs/promises";
 import { createServer, STATUS_CODES, type IncomingMessage, type Server } from "node:http";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { Readable, type Duplex } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { TextDecoder } from "node:util";
@@ -16,9 +16,8 @@ import { IgnorePatterns } from "./ignore.ts";
 const supportedMethods = new Set(["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"]);
 const allowedMethods = [...supportedMethods].join(", ");
 const allowedRequestHeaders = "Content-Type, Range, If-None-Match, If-Modified-Since, If-Range";
-const exposedResponseHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch";
+const exposedResponseHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch, Link";
 const editContentType = "application/vnd.telepath.edit+json";
-const directoryContentType = "application/vnd.telepath.directory+json; charset=utf-8";
 const jsonContentType = "application/json; charset=utf-8";
 const maximumEditBytes = 16_777_216;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -28,16 +27,19 @@ const defaultPortRangeWidth = 100;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
+/** One addressable item in a one-level directory listing. */
 export type DirectoryEntry = {
-  name: string;
-  type: string;
+  path: string;
+  kind: string;
   [property: string]: JsonValue;
 };
-export type DirectoryListing = { path: string; entries: DirectoryEntry[] };
+/** A JSON description of a directory and its immediate children. */
+export type DirectoryListing = { path: string; kind: "dir"; entries: DirectoryEntry[] };
 export type FileChangeEvent = { type: "created" | "modified" | "deleted"; path: string };
 export type FileServerResource =
   | { readonly type: "missing" }
   | { readonly type: "dir" }
+  | { readonly type: "symlink" }
   | { readonly type: "file"; readonly size: number; readonly modified: string };
 export type FileServerExtensionContext = {
   readonly path: string;
@@ -303,6 +305,15 @@ export class FileServer {
     if (await this.isIgnoredPath(parsed)) { sendError(request, response, 404, "not found"); return; }
     const root = this.resolvedRoot as string;
     const inspected = await inspectPath(root, parsed.segments);
+    const wantsJson = hasJsonQuery(request.url);
+
+    // An exact link has one safe representation. All other requests must be
+    // refused before method dispatch, including OPTIONS and unknown methods.
+    if (inspected.stats?.isSymbolicLink()
+      && !(wantsJson && !parsed.trailingSlash && (request.method === "GET" || request.method === "HEAD"))) {
+      sendError(request, response, 403, "forbidden");
+      return;
+    }
 
     if (!isSupportedMethod(request.method)) {
       response.set("Allow", allowedMethods);
@@ -315,6 +326,11 @@ export class FileServer {
     if (this.temporaryPaths.has(inspected.absolutePath)) { sendError(request, response, 404, "not found"); return; }
     const extensionContext = this.createExtensionContext(parsed, inspected);
     if (this.extension?.handle !== undefined && await runHandleHook(this.extension.handle, request, response, extensionContext)) return;
+    if (wantsJson && (request.method === "PUT" || request.method === "PATCH" || request.method === "DELETE")) {
+      response.set("Allow", "GET, HEAD, OPTIONS");
+      sendError(request, response, 405, "method not allowed");
+      return;
+    }
     if (request.method === "PUT") { await this.put(request, response, parsed, inspected); return; }
     if (request.method === "PATCH") { await this.patch(request, response, parsed, inspected); return; }
     if (request.method === "DELETE") { await this.delete(request, response, parsed, inspected); return; }
@@ -322,22 +338,56 @@ export class FileServer {
       sendError(request, response, 404, "not found");
       return;
     }
+    if (inspected.stats.isSymbolicLink()) {
+      sendJsonDescription(request, response, { path: parsed.path, kind: "symlink" });
+      return;
+    }
     if (inspected.stats.isFile()) {
       if (parsed.trailingSlash) { sendError(request, response, 404, "not found"); return; }
+      if (wantsJson) {
+        sendJsonDescription(request, response, fileDescription(parsed.path, inspected.absolutePath, inspected.stats));
+        return;
+      }
       await sendFile(request, response, inspected.absolutePath);
       return;
     }
     if (inspected.stats.isDirectory()) {
-      let listing = await readDirectoryListing(inspected.absolutePath, parsed.path, this.temporaryPaths, this.ignorePatterns);
-      if (this.extension?.listing !== undefined) {
-        try { listing = await this.extension.listing(request, listing, extensionContext); }
-        catch (error) { throw mapExtensionHookError(error); }
+      if (wantsJson) {
+        let listing = await readDirectoryListing(inspected.absolutePath, parsed.path, this.temporaryPaths, this.ignorePatterns);
+        if (this.extension?.listing !== undefined) {
+          try { listing = await this.extension.listing(request, listing, extensionContext); }
+          catch (error) { throw mapExtensionHookError(error); }
+        }
+        if (!isDirectoryListing(listing, parsed.path)) throw new Error("extension returned an invalid directory listing");
+        sendJsonDescription(request, response, listing);
+        return;
       }
-      if (!isDirectoryListing(listing, parsed.path)) throw new Error("extension returned an invalid directory listing");
-      sendDirectory(request, response, listing);
+      if (!parsed.trailingSlash) {
+        const name = parsed.segments.at(-1) as string;
+        const query = request.url.includes("?") ? request.url.slice(request.url.indexOf("?")) : "";
+        response.set("Location", `${encodeURIComponent(name)}/${query}`);
+        response.status(307).end();
+        return;
+      }
+      await this.sendDirectoryIndex(request, response, parsed);
       return;
     }
     sendError(request, response, 404, "not found");
+  }
+
+  private async sendDirectoryIndex(request: Request, response: Response, directory: ParsedPath): Promise<void> {
+    const segments = [...directory.segments, "index.html"];
+    const parsed: ParsedPath = { segments, path: segments.join("/"), trailingSlash: false };
+    const missingIndex = (): void => sendError(request, response, 404, "add ?json to list the directory");
+    if (await this.isIgnoredPath(parsed)) { missingIndex(); return; }
+    const inspected = await inspectPath(this.resolvedRoot as string, segments);
+    if (inspected.stats?.isSymbolicLink()) { sendError(request, response, 403, "forbidden"); return; }
+    await ensureConfined(this.resolvedRoot as string, inspected.deepestExistingPath);
+    if (this.temporaryPaths.has(inspected.absolutePath) || inspected.missing || inspected.stats?.isFile() !== true) {
+      missingIndex();
+      return;
+    }
+    await sendFile(request, response, inspected.absolutePath);
   }
 
   private async put(request: Request, response: Response, parsed: ParsedPath, inspected: InspectedPath): Promise<void> {
@@ -433,7 +483,7 @@ export class FileServer {
       trailingSlash: parsed.trailingSlash,
       resource,
       inspect: (path: string) => runContextOperation(async () => {
-        const resolved = await this.resolveContextPath(path);
+        const resolved = await this.resolveContextPath(path, true);
         if (resolved.parsed.trailingSlash && resolved.inspected.stats?.isFile()) throw new HttpError(404, "not found");
         return resourceFromInspection(resolved.inspected);
       }),
@@ -505,8 +555,8 @@ export class FileServer {
     await this.publishMutation({ type: "deleted", path }, absolutePath);
   }
 
-  private async resolveContextPath(path: string): Promise<{ parsed: ParsedPath; inspected: InspectedPath }> {
-    return this.resolveParsedPath(await this.parseContextTarget(path));
+  private async resolveContextPath(path: string, allowExactSymlink = false): Promise<{ parsed: ParsedPath; inspected: InspectedPath }> {
+    return this.resolveParsedPath(await this.parseContextTarget(path), allowExactSymlink);
   }
 
   /** Parses an extension context path, hiding an ignored path exactly as a request is hidden. */
@@ -537,9 +587,10 @@ export class FileServer {
     return isDirectory ? asDirectory : asFile;
   }
 
-  private async resolveParsedPath(parsed: ParsedPath): Promise<{ parsed: ParsedPath; inspected: InspectedPath }> {
+  private async resolveParsedPath(parsed: ParsedPath, allowExactSymlink = false): Promise<{ parsed: ParsedPath; inspected: InspectedPath }> {
     const root = this.resolvedRoot as string;
     const inspected = await inspectPath(root, parsed.segments);
+    if (inspected.stats?.isSymbolicLink() && (!allowExactSymlink || parsed.trailingSlash)) throw new HttpError(403, "forbidden");
     await ensureConfined(root, inspected.deepestExistingPath);
     if (this.temporaryPaths.has(inspected.absolutePath)) throw new HttpError(404, "not found");
     return { parsed, inspected };
@@ -728,6 +779,7 @@ export class FileServer {
       if (await this.isIgnoredPath(parsed)) throw new HttpError(404, "not found");
       const root = this.resolvedRoot as string;
       const inspected = await inspectPath(root, parsed.segments);
+      if (inspected.stats?.isSymbolicLink()) throw new HttpError(403, "forbidden");
       await ensureConfined(root, inspected.deepestExistingPath);
       if (this.temporaryPaths.has(inspected.absolutePath)) throw new HttpError(404, "not found");
       if (!parsed.trailingSlash || inspected.missing || inspected.stats?.isDirectory() !== true) {
@@ -755,7 +807,8 @@ export class FileServer {
       if (parsed instanceof HttpError) { sendConnectError(socket, parsed.status, parsed.message); return; }
       await this.ready;
       if (await this.isIgnoredPath(parsed)) { sendConnectError(socket, 404, "not found"); return; }
-      await inspectPath(this.resolvedRoot as string, parsed.segments);
+      const inspected = await inspectPath(this.resolvedRoot as string, parsed.segments);
+      if (inspected.stats?.isSymbolicLink()) throw new HttpError(403, "forbidden");
       sendConnectError(socket, 405, "method not allowed");
     } catch (error) {
       const mapped = mapError(error);
@@ -814,34 +867,32 @@ function sameHeaders(
 function resourceFromInspection(inspected: InspectedPath): FileServerResource {
   if (inspected.missing || inspected.stats === undefined) return { type: "missing" };
   if (inspected.stats.isDirectory()) return { type: "dir" };
+  if (inspected.stats.isSymbolicLink()) return { type: "symlink" };
   return { type: "file", size: inspected.stats.size, modified: inspected.stats.mtime.toISOString() };
 }
 
 function isDirectoryListing(value: unknown, expectedPath: string): value is DirectoryListing {
-  if (!isJsonObject(value) || typeof value.path !== "string" || !Array.isArray(value.entries)) return false;
+  if (!isJsonObject(value) || typeof value.path !== "string" || value.kind !== "dir" || !Array.isArray(value.entries)) return false;
   if (value.path !== expectedPath) return false;
-  if (Object.keys(value).some((key) => key !== "path" && key !== "entries")) return false;
+  if (!hasExactKeys(value, ["path", "kind", "entries"])) return false;
   if (value.path.startsWith("/") || value.path.endsWith("/")) return false;
-  try { parseContextPath(value.path); }
+  let segments: string[];
+  try { segments = parseContextPath(value.path).segments; }
   catch { return false; }
-  return value.entries.every(isDirectoryEntry);
+  return value.entries.every((entry) => isDirectoryEntry(entry, segments));
 }
 
-function isAddressableEntryName(name: string): boolean {
-  return name.length > 0
-    && isWellFormedString(name)
-    && !name.startsWith(".")
-    && !name.includes("/")
-    && !name.includes("\\")
-    && !name.includes("\0");
-}
-
-function isDirectoryEntry(entry: unknown): entry is DirectoryEntry {
-  if (!isJsonObject(entry) || typeof entry.name !== "string" || typeof entry.type !== "string") return false;
-  if (!isAddressableEntryName(entry.name) || !isJsonValue(entry)) return false;
-  if (entry.type === "dir" || entry.type === "link") return hasExactKeys(entry, ["name", "type"]);
-  if (entry.type !== "file") return true;
-  if (!hasExactKeys(entry, ["name", "type", "size", "modified"])) return false;
+function isDirectoryEntry(entry: unknown, parentSegments: readonly string[]): entry is DirectoryEntry {
+  if (!isJsonObject(entry) || typeof entry.path !== "string" || typeof entry.kind !== "string") return false;
+  if (!isJsonValue(entry)) return false;
+  let segments: string[];
+  try { segments = parseContextPath(entry.path).segments; }
+  catch { return false; }
+  if (segments.length !== parentSegments.length + 1 || !parentSegments.every((segment, index) => segments[index] === segment)) return false;
+  if (entry.kind === "dir" || entry.kind === "symlink") return hasExactKeys(entry, ["path", "kind"]);
+  if (entry.kind !== "file") return true;
+  if (!["path", "kind", "contentType", "size", "modified"].every((key) => Object.hasOwn(entry, key))) return false;
+  if (typeof entry.contentType !== "string") return false;
   if (typeof entry.size !== "number" || !Number.isSafeInteger(entry.size) || entry.size < 0) return false;
   if (typeof entry.modified !== "string") return false;
   const modified = new Date(entry.modified);
@@ -943,6 +994,11 @@ function parseRequestPath(url: string): ParsedPath | HttpError {
   return { segments, path: segments.join("/"), trailingSlash };
 }
 
+function hasJsonQuery(url: string): boolean {
+  const queryStart = url.indexOf("?");
+  return queryStart !== -1 && new URLSearchParams(url.slice(queryStart + 1)).has("json");
+}
+
 function parseContextPath(path: string): ParsedPath {
   if (!isWellFormedString(path)) throw new HttpError(400, "invalid path");
   if (path.startsWith("/")) throw new HttpError(400, "invalid path");
@@ -979,10 +1035,17 @@ async function inspectPath(root: string, segments: readonly string[]): Promise<I
 
   if (segments.length === 0) {
     currentStats = await lstat(root);
+    if (currentStats.isSymbolicLink()) {
+      // The configured root was resolved at startup. If a local process later
+      // replaces that path with a link outside the root, report the canonical
+      // escape as 404 before treating it as an ordinary link request.
+      await ensureConfined(root, root);
+      throw new HttpError(403, "forbidden");
+    }
     return { absolutePath, deepestExistingPath, missing: false, stats: currentStats };
   }
 
-  for (const segment of segments) {
+  for (const [index, segment] of segments.entries()) {
     currentPath = join(currentPath, segment);
     try {
       currentStats = await lstat(currentPath);
@@ -992,7 +1055,10 @@ async function inspectPath(root: string, segments: readonly string[]): Promise<I
       }
       throw error;
     }
-    if (currentStats.isSymbolicLink()) throw new HttpError(403, "forbidden");
+    if (currentStats.isSymbolicLink()) {
+      if (index !== segments.length - 1) throw new HttpError(403, "forbidden");
+      return { absolutePath, deepestExistingPath, missing: false, stats: currentStats };
+    }
     if (!currentStats.isFile() && !currentStats.isDirectory()) throw new HttpError(404, "not found");
     deepestExistingPath = currentPath;
   }
@@ -1062,7 +1128,7 @@ async function sendFile(request: Request, response: Response, path: string): Pro
   }
 }
 
-function fileMetadata(path: string, fileStats: Stats): { contentType: string; etag: string; lastModified: string } {
+function fileMetadata(path: string, fileStats: Stats): { contentType: string; etag: string; lastModified: string; link: string } {
   const lookedUpType = mimeTypes.lookup(path) || "application/octet-stream";
   const lowerType = lookedUpType.toLowerCase();
   const contentType = lowerType.startsWith("text/") || lowerType === "application/json" || lowerType.endsWith("+json")
@@ -1072,12 +1138,23 @@ function fileMetadata(path: string, fileStats: Stats): { contentType: string; et
     contentType,
     etag: `W/"${fileStats.size.toString(16)}-${fileStats.mtime.getTime().toString(16)}"`,
     lastModified: fileStats.mtime.toUTCString(),
+    link: `<${encodeURIComponent(basename(path))}?json>; rel="describedby"`,
+  };
+}
+
+function fileDescription(path: string, absolutePath: string, fileStats: Stats): DirectoryEntry {
+  return {
+    path,
+    kind: "file",
+    contentType: fileMetadata(absolutePath, fileStats).contentType,
+    size: fileStats.size,
+    modified: fileStats.mtime.toISOString(),
   };
 }
 
 function setFileHeaders(
   response: Response,
-  metadata: { contentType: string; etag: string; lastModified: string },
+  metadata: { contentType: string; etag: string; lastModified: string; link: string },
   contentLength: number,
 ): void {
   response.set({
@@ -1086,11 +1163,12 @@ function setFileHeaders(
     "Last-Modified": metadata.lastModified,
     "ETag": metadata.etag,
     "Accept-Ranges": "bytes",
+    "Link": metadata.link,
   });
 }
 
-function sendNotModified(response: Response, metadata: { etag: string; lastModified: string }): void {
-  response.set({ "ETag": metadata.etag, "Last-Modified": metadata.lastModified });
+function sendNotModified(response: Response, metadata: { etag: string; lastModified: string; link: string }): void {
+  response.set({ "ETag": metadata.etag, "Last-Modified": metadata.lastModified, "Link": metadata.link });
   response.status(304).end();
 }
 
@@ -1177,9 +1255,9 @@ async function streamFile(handle: FileHandle, response: Response, start?: number
   });
 }
 
-function sendDirectory(request: Request, response: Response, listing: DirectoryListing): void {
-  const body = Buffer.from(JSON.stringify(listing));
-  response.set({ "Content-Type": directoryContentType, "Content-Length": String(body.length) });
+function sendJsonDescription(request: Request, response: Response, description: DirectoryListing | DirectoryEntry): void {
+  const body = Buffer.from(JSON.stringify(description));
+  response.set({ "Content-Type": jsonContentType, "Content-Length": String(body.length) });
   response.status(200);
   if (request.method === "HEAD") response.end();
   else response.end(body);
@@ -1191,7 +1269,7 @@ async function readDirectoryListing(
   temporaryPaths: ReadonlySet<string>,
   ignorePatterns: IgnorePatterns,
 ): Promise<DirectoryListing> {
-  return { path, entries: await readDirectoryEntries(absolutePath, path, temporaryPaths, ignorePatterns) };
+  return { path, kind: "dir", entries: await readDirectoryEntries(absolutePath, path, temporaryPaths, ignorePatterns) };
 }
 
 async function readDirectoryEntries(
@@ -1206,18 +1284,20 @@ async function readDirectoryEntries(
     const name = decodeDirectoryName(directoryEntry);
     if (name === undefined || name.startsWith(".") || name.includes("\\")) continue;
     if (temporaryPaths.has(join(absolutePath, name))) continue;
-    if (ignorePatterns.hides(path === "" ? name : `${path}/${name}`, directoryEntry.isDirectory())) continue;
-    if (directoryEntry.isSymbolicLink()) { entries.push({ name, type: "link" }); continue; }
-    if (directoryEntry.isDirectory()) { entries.push({ name, type: "dir" }); continue; }
+    const entryPath = path === "" ? name : `${path}/${name}`;
+    if (ignorePatterns.hides(entryPath, directoryEntry.isDirectory())) continue;
+    if (directoryEntry.isSymbolicLink()) { entries.push({ path: entryPath, kind: "symlink" }); continue; }
+    if (directoryEntry.isDirectory()) { entries.push({ path: entryPath, kind: "dir" }); continue; }
     if (!directoryEntry.isFile()) continue;
     try {
       const fileStats = await stat(join(absolutePath, name));
-      if (fileStats.isFile()) entries.push({ name, type: "file", size: fileStats.size, modified: fileStats.mtime.toISOString() });
+      if (fileStats.isFile()) entries.push(fileDescription(entryPath, join(absolutePath, name), fileStats));
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT") && !hasErrorCode(error, "ENOTDIR")) throw error;
     }
   }
-  entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+  const lastSegment = (entry: DirectoryEntry): string => entry.path.slice(entry.path.lastIndexOf("/") + 1);
+  entries.sort((left, right) => lastSegment(left) < lastSegment(right) ? -1 : lastSegment(left) > lastSegment(right) ? 1 : 0);
   return entries;
 }
 

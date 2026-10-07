@@ -7,7 +7,7 @@ import { parseRawResponse, rawRequest, rawTcpRequest, startFixture } from "./hel
 import type { FileServerConformanceFactory } from "./types.js";
 
 const allowedMethods = "GET, HEAD, PUT, PATCH, DELETE, OPTIONS";
-const exposedHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch";
+const exposedHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch, Link";
 
 export function defineErrorsConformance(factory: FileServerConformanceFactory): void {
   test("file-server conformance: method and JSON error rules", async (context) => {
@@ -23,6 +23,9 @@ export function defineErrorsConformance(factory: FileServerConformanceFactory): 
     const missing = await fetch(`${running.baseUrl}/missing`);
     assert.equal(missing.status, 404);
     assert.deepEqual(await missing.json(), { error: "not found" });
+    const missingDescription = await fetch(`${running.baseUrl}/missing?json`);
+    assert.equal(missingDescription.status, 404);
+    assert.deepEqual(await missingDescription.json(), { error: "not found" });
     const head = await fetch(`${running.baseUrl}/missing`, { method: "HEAD" });
     assert.equal(head.status, 404);
     assert.equal(await head.text(), "");
@@ -92,5 +95,24 @@ export function defineErrorsConformance(factory: FileServerConformanceFactory): 
       assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
       assert.equal(typeof (await response.json() as { error: unknown }).error, "string");
     }
+  });
+
+  test("file-server conformance: writes to JSON descriptions return a restricted 405", async (context) => {
+    const running = await startFixture(context, factory, { "file.txt": "file", "dir/child.txt": "child", ".hidden": "hidden" });
+    await symlink("file.txt", join(running.root, "link.txt"));
+    for (const path of ["/file.txt?json", "/dir?json", "/missing?json", "/file.txt?json=anything"]) {
+      for (const method of ["PUT", "PATCH", "DELETE"]) {
+        const response = await fetch(`${running.baseUrl}${path}`, { method });
+        assert.equal(response.status, 405, `${method} ${path}`);
+        assert.equal(response.headers.get("allow"), "GET, HEAD, OPTIONS", `${method} ${path}`);
+        assert.deepEqual(await response.json(), { error: "method not allowed" }, `${method} ${path}`);
+      }
+    }
+    for (const [path, status] of [["/.hidden?json", 404], ["/link.txt?json", 403], ["/bad%2Fpath?json", 400]] as const) {
+      for (const method of ["PUT", "PATCH", "DELETE"]) {
+        assert.equal((await fetch(`${running.baseUrl}${path}`, { method })).status, status, `${method} ${path}`);
+      }
+    }
+    assert.equal((await fetch(`${running.baseUrl}/file.txt?JSON`, { method: "DELETE" })).status, 204);
   });
 }

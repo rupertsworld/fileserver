@@ -25,7 +25,7 @@ export function defineChangesConformance(factory: FileServerConformanceFactory):
       "tree/nested/b.txt": "b",
     });
     const rootSocket = await openSocket(running.baseUrl, "/");
-    const socket = await openSocket(running.baseUrl, "/scope/");
+    const socket = await openSocket(running.baseUrl, "/scope/?json=ignored");
     context.after(() => { rootSocket.close(); socket.close(); });
     const rootEvent = nextEvent(rootSocket);
     let event = nextEvent(socket);

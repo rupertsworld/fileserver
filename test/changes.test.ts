@@ -262,7 +262,7 @@ test("a malformed client frame closes that subscriber without crashing the serve
   });
   (socket as unknown as { _socket: { write(bytes: Uint8Array): void } })._socket.write(Uint8Array.from([0x81, 0x01, 0x78]));
   await closed;
-  assert.equal((await fetch(`${baseUrl}/`)).status, 200);
+  assert.equal((await fetch(`${baseUrl}/?json`)).status, 200);
 });
 
 test("close terminates subscriptions and releases the listening address", async () => {
