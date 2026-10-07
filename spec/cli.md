@@ -1,23 +1,35 @@
-# CLI conventions
+# CLI
 
-The contract every `sv-<noun>` binary shares. The per-server CLI
-specs state only what is particular — positional arguments, the base
-port, the banner's middle lines, any subcommands — and inherit the
-rest.
+`fileserver [path]` starts the server for one directory. This file specifies
+its path argument, options, startup output, errors, signals, and config.
+
+## Served directory
+
+`path` is an optional positional argument, defaulting to the current
+directory. The root is resolved through symbolic links at startup, so a
+symlinked directory serves its target. It must resolve to a real directory,
+so a mistyped path fails immediately rather than returning `404` for every
+later request. A leading `~` or `~/` expands to the home directory of the
+invoking user; any other tilde is literal. Exactly one positional argument
+is accepted.
+
+Readiness includes the change watcher: it is running before the listener
+binds, so no change between bind and watch can be missed. Shutdown closes
+the watcher and open subscriptions along with the listener.
 
 ## Options
 
-Every binary accepts:
+`fileserver` accepts:
 
 - `--host <host>` (default `127.0.0.1`) — the bind address; must be
   non-empty.
-- `--port <port>` — a decimal integer from 0 through 65535. Each
-  server owns a hundred-port range starting at its base port. Without
-  `--port` the server binds the base port, or the next free port in
-  the range when that is taken; with `--port N` it binds `N` or
-  fails — an explicit choice never moves; `--port 0` binds a port the
-  operating system chooses, for hosts that discover it from the
-  listening socket.
+- `--port <port>` — a decimal integer from 0 through 65535. Without
+  `--port`, `fileserver` binds port `8765`, or the next free port through
+  `8864` when that is taken. With `--port N`, it binds `N` or fails; an
+  explicit choice never moves. `--port 0` binds a port the operating system
+  chooses, for hosts that discover it from the listening socket.
+- `--ignore <pattern>` — adds a pattern for one run and may be repeated;
+  patterns are added to those in the [config](#config).
 - `--help` — the usage block to stdout, exit 0.
 - `--version` — the bare version to stdout, exit 0.
 
@@ -25,11 +37,10 @@ Flags take their value as the following argument.
 
 ## Startup and banner
 
-A server verifies its preconditions — the served path resolves, the
-credential is accepted upstream — before binding, and prints its
-banner to stdout only once the listener is accepting connections. The
-first line is `sv-<noun> <version>`; the middle lines are aligned
-`label: value` pairs the server's own spec defines; the last is
+`fileserver` checks that the served path resolves before binding and prints
+its banner to stdout only once the listener is accepting connections. The
+first line is `fileserver <version>`; the middle lines are the aligned
+`label: value` pairs in [Terminal output](#terminal-output); the last is
 `url:    http://<host>:<port>`, reporting the port actually bound. The
 `url:` line is the machine-parseable readiness signal: once it is
 printed, the server is accepting connections and handling signals.
@@ -43,68 +54,49 @@ plain, so the `url:` line stays parseable.
 
 ## Errors and signals
 
-Errors go to stderr as one `sv-<noun>: <message>` line and exit 1 —
-e.g. `fileserver: port 8765 is already in use`; an unknown argument's
-error is followed by the usage block. `SIGINT`/`SIGTERM` shut down
+Errors go to stderr as one `fileserver: <message>` line and exit 1 —
+e.g. `fileserver: port 8765 is already in use`; an error for an unknown
+argument is followed by the usage block. `SIGINT`/`SIGTERM` shut down
 cleanly and silently with exit 0.
 
 ## Config
 
-A server that stores configuration keeps it at
-`~/.config/sv-<noun>/config.json` — one JSON object per binary. Each
-server's spec lists its config schema. Any config the binary writes
-creates the directory as needed, goes through a temporary file and
-rename so a crash never leaves a partial file, and leaves mode 0600,
-since the file may hold a credential. A config file that is
-unreadable, malformed, or not the documented shape is an error naming
-the file, or the subcommand that rewrites it where there is one,
-never a silent fallback.
+`fileserver` keeps one JSON object at
+`~/.config/fileserver/config.json`. It has one optional member:
 
-## auth
+- `ignore` — an array of patterns in `.gitignore` syntax. Paths that
+  match are [hidden](server.md#url-mapping), exactly like dot-prefixed
+  ones.
 
-Servers that authenticate to an upstream hold a credential made of one
-or more values. Each server's spec lists the values in order and gives
-each one:
+With neither config nor `--ignore`, nothing is ignored. Patterns follow
+`.gitignore` rules, matched against paths relative to the root without
+regard to letter case, as git does with `core.ignorecase`. For example,
+`node_modules/` hides every `node_modules` directory and everything inside
+it.
 
-- its config member name;
-- its environment variable;
-- its prompt label;
-- whether it is secret.
+`fileserver` only reads the config; it never writes it. An unreadable,
+malformed, or invalid config file causes an error naming the file, never a
+silent fallback.
 
-`sv-linear` has one secret value, an API key. A CalDAV server would
-have three: a server URL, a username, and a secret password.
+## Terminal output
 
-The credential is resolved at startup in this order:
+On successful start:
 
-1. the environment, when every value's variable is set. When some are
-   set but not all, startup exits 1 naming the missing variables; the
-   environment and the stored config are never mixed;
-2. the stored [config](#config), whose shape is exactly one member per
-   value, each a non-empty string: for `sv-linear`,
-   `{"apiKey": "<key>"}`;
-3. otherwise exit 1 telling the user to run `sv-<noun> auth`.
+```
+fileserver 0.2.0
+root:   /root/Pictures
+url:    http://127.0.0.1:8765
+```
 
-No credential value is ever served. Secret values are also never
-echoed or logged.
+```
+Usage: fileserver [path] [options]
 
-`sv-<noun> auth` stores the credential. Every server runs the same
-interactive flow, built with `@clack/prompts`:
+Serve a live directory over HTTP and WebSocket: read, list, write, edit, delete.
 
-1. an intro banner;
-2. a note telling the user where to obtain the credential;
-3. one prompt per value, in the listed order, masked for secret values;
-4. a spinner while the credential is verified upstream;
-5. an outro naming the authenticated identity.
-
-A server's spec supplies only what differs: its values, the note, the
-verification, and the identity. Success writes the [config](#config).
-A rejected credential writes nothing and exits 1; cancelling any
-prompt writes nothing and exits 1. Re-running replaces the stored
-credential, malformed or not. `auth` never binds a port.
-
-`auth` also has a non-interactive form, with flags each server's spec
-defines. Secret values are read from stdin, never from arguments, so
-they stay out of shell history and process listings. The
-non-interactive form runs the same verification and atomic write, and
-prints one plain `Authenticated as <identity>` line, with no prompt UI.
-`sv-<noun> auth --help` prints the auth usage.
+  path         directory to serve (default: current directory)
+  --host       bind address (default: 127.0.0.1)
+  --port       port (default: 8765, or the next free port up to 8864; 0 for any free port)
+  --ignore     hide paths matching a .gitignore pattern; repeatable (added to the config's ignore list)
+  --help       show this help
+  --version    print the version
+```

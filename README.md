@@ -66,7 +66,7 @@ curl -X DELETE http://127.0.0.1:8765/photos/copy.jpg
 Directory `GET`s return a one-level JSON listing. `PUT` atomically creates or
 replaces any file and creates missing parents; `PATCH` performs an anchored
 literal edit of a UTF-8 text file; `DELETE` removes a file or directory tree.
-`OPTIONS` provides the CORS preflight response. See [`spec/files/`](../../spec/files/) for the
+`OPTIONS` provides the CORS preflight response. See [`spec/`](spec/index.md) for the
 complete wire contract, CLI, and API.
 
 Open a WebSocket at `/`, or at the slash-terminated URL of any existing

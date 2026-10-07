@@ -1,7 +1,7 @@
 # Server
 
-The base wire contract over HTTP and WebSocket. Every path below is relative
-to the served directory, called the root. A protocol extension inherits this
+The wire contract over HTTP and WebSocket. Every path below is relative
+to the served directory, called the root. A protocol extension follows this
 contract and documents only the resources, representations, or event-path
 mapping it adds.
 
@@ -9,8 +9,11 @@ mapping it adds.
 
 The resource is the request-target's undecoded path — or, when the
 exported app is mounted beneath a host's prefix, the path remaining after
-that prefix. The query is ignored. Each segment is percent-decoded exactly
-once. A malformed escape, invalid
+that prefix. For `GET` and `HEAD`, the presence of a case-sensitive `json`
+query parameter selects the JSON description; its value does not matter.
+Other query parameters do not change the selected operation or
+representation. WebSocket upgrades ignore the query.
+Each segment is percent-decoded exactly once. A malformed escape, invalid
 UTF-8, a null byte, a backslash (raw or encoded), an encoded `/`, or an
 empty interior segment (`/a//b`) is `400 Bad Request`. A decoded segment
 that begins with `.` is `404 Not Found` — rejected, never normalised into a
@@ -20,24 +23,30 @@ server's [ignore patterns](cli.md#config) is hidden the same way.
 Hidden paths are left out of directory listings and the change stream, and
 the server does not watch them.
 
-`/` is the root. `/dir` and `/dir/` both address an existing directory;
-`/file/` is `404`. `PUT` or `PATCH` to `/` or to any slash-terminated path
-is `409 Conflict`. `DELETE` accepts either spelling of a directory, except
-the root, which is `409`.
+`/` is the root. For `GET` and `HEAD`, either spelling of a directory
+selects its listing with `?json`; without `?json`, the slash-terminated URL
+serves `index.html` and the other redirects to it (see
+[Directories](#directories)). `GET` or `HEAD` on `/file/` is `404`.
+Without `?json`, `PUT` or `PATCH` to `/` or to any slash-terminated path is
+`409 Conflict`. `DELETE` without `?json` accepts either spelling of a
+directory, except the root, which is `409`. Writes use the file address
+without `?json`; [Errors](#errors) specifies the base response to writes
+that carry `?json`.
 
 ## Routes
 
 ```
-GET     /<path>   read a file, or list a directory
-HEAD    /<path>   the same headers without the body
-PUT     /<path>   write a whole file
-PATCH   /<path>   replace an anchored span within a text file
-DELETE  /<path>   remove a file or directory
-OPTIONS /<path>   CORS preflight
-WS      /<dir>/   subscribe to root-wide change signals
+GET     /<path>        read file bytes or a directory index page
+GET     /<path>?json   describe an item or list a directory
+HEAD    /<path>        the corresponding GET status and headers, without a body
+PUT     /<path>        write a whole file
+PATCH   /<path>        replace an anchored span within a text file
+DELETE  /<path>        remove a file or directory
+OPTIONS /<path>        CORS preflight
+WS      /<dir>/        subscribe to root-wide change signals
 ```
 
-Every syntactically valid path supports this method set and no other;
+Every syntactically valid path recognises this method set and no other;
 fileserver adds no prefix and reserves no route, so a host that mounts it
 under a name (`/photos/2026/cat.jpg`) produces no redundant segment. There
 is no health endpoint: readiness is the listening socket and, for a child
@@ -53,9 +62,37 @@ process, the CLI's machine-readable `url:` announcement.
   unknown;
 - `Content-Length`, `Last-Modified` (HTTP-date), and a weak `ETag` that
   changes whenever the file's size or modification time changes;
-- `Accept-Ranges: bytes`.
+- `Accept-Ranges: bytes`;
+- `Link: <name?json>; rel="describedby"`, where `name` is the percent-encoded
+  last path segment of the file. The relative reference works at any mount
+  prefix, including when a directory URL serves `index.html`.
 
 There is no application-level size limit on a file.
+
+`GET /<path>?json` on a regular file returns its description as
+`application/json; charset=utf-8`, regardless of whether its format has a
+parser. The default object has exactly `path`, `kind`, `contentType`, `size`,
+and `modified`:
+
+```json
+{ "path": "notes/todo.md", "kind": "file", "contentType": "text/markdown; charset=utf-8", "size": 812, "modified": "2026-07-24T10:02:11.000Z" }
+```
+
+`path` is the full decoded path within the root, without a leading or
+trailing slash, and is the address of the item relative to the root.
+`contentType` is exactly the `Content-Type` header on the byte response,
+including any charset; `size` is bytes; `modified` is
+`Date.toISOString()` for the modification time of the file. The default
+object has no `name`, `url`, or `created` key. A parser may add keys to this
+same object but may not replace or remove the default keys. None of the
+default keys is writable: `path`, `kind`, `contentType`, `size`, and
+`modified` all come from the file. A client must tolerate added keys.
+
+JSON descriptions carry the exact serialised `Content-Length` but no `ETag`,
+`Last-Modified`, `Accept-Ranges`, or `Link` header. `If-None-Match`,
+`If-Modified-Since`, `If-Range`, and `Range` do not apply to them: a `?json`
+read returns the full `200` description, never a byte range or `304`. A
+byte response and a JSON description cannot share a validator.
 
 **Ranges.** One `bytes` range is supported, in closed (`0-99`),
 open-ended (`100-`), or suffix (`-100`) form. A satisfiable range is
@@ -73,51 +110,77 @@ mismatch or an invalid value returns the full `200`.
 with weak comparison; when it is present, `If-Modified-Since` is ignored
 whether or not a tag matches. Otherwise `If-Modified-Since` applies. Both
 are evaluated before `Range`. A match is `304 Not Modified` with the
-validator headers and no body. An unparseable date is ignored. Mutation
-precondition headers (`If-Match`, `If-Unmodified-Since`) are ignored.
+validator and `Link` headers and no body. An unparseable date is ignored.
+Mutation precondition headers (`If-Match`, `If-Unmodified-Since`) are ignored.
 
-`HEAD` applies the conditionals, ignores `Range`, and returns the status
-and headers a full `GET` would, without a body. A missing path is `404`.
+`HEAD` on a file applies the conditionals for file bytes, ignores `Range`,
+and returns the status and headers of a full file `GET`, without a body.
+`HEAD` with `?json` returns the status and headers of the corresponding JSON
+`GET`, including its exact serialised `Content-Length`, without a body.
+A missing path is `404` with or without `?json`.
 
 ## Directories
 
-`GET` on a directory — including `/`, the root — returns a listing as
-`Content-Type: application/vnd.telepath.directory+json; charset=utf-8`,
-so a listing and a `.json` file are distinguishable by type:
+`GET /<dir>/` serves a visible regular `index.html` in that directory as an
+ordinary file if one exists. This includes `GET /` for the root. The response
+uses the file reading rules above, including `Range`, conditionals, and
+`Link: <index.html?json>; rel="describedby"`. If `index.html` is absent,
+hidden, or a nonregular object other than a symbolic link, the response is
+the standard `404` error body with a message telling the caller to add
+`?json` to list the directory. A visible symbolic link named `index.html`
+gives `403` under [Confinement](#confinement). The server does not generate a
+listing page.
+
+`GET /<dir>` without `?json` redirects with `307 Temporary Redirect` to the
+slash-terminated URL. `Location` is a relative reference formed from the
+percent-encoded last segment, followed by `/`, and preserves the query;
+for example, a request to `.../notes` receives `Location: notes/`.
+
+`GET /<dir>?json` and `GET /<dir>/?json` both return a one-level listing
+without redirecting, as `application/json; charset=utf-8`. This includes
+`GET /?json` for the root:
 
 ```json
 {
   "path": "notes",
+  "kind": "dir",
   "entries": [
-    { "name": "archive", "type": "dir" },
-    { "name": "photos", "type": "link" },
-    { "name": "todo.md", "type": "file", "size": 812, "modified": "2026-07-24T10:02:11.000Z" }
+    { "path": "notes/archive", "kind": "dir" },
+    { "path": "notes/photos", "kind": "symlink" },
+    { "path": "notes/todo.md", "kind": "file", "contentType": "text/markdown; charset=utf-8", "size": 812, "modified": "2026-07-24T10:02:11.000Z" }
   ]
 }
 ```
 
 `path` is the decoded path with no leading or trailing slash, `""` for the
-root. `entries` is one level deep, sorted by `name` in JavaScript's default
-string order. A regular file is exactly `{ name, type: "file", size,
-modified }` with `size` in bytes and `modified` as `Date.toISOString()`; a
-directory is exactly `{ name, type: "dir" }`; a symbolic link is exactly
-`{ name, type: "link" }` and nothing about its target. Sockets, devices,
-and other objects are omitted, as are entries whose names are not valid
-UTF-8 or contain `\` (they cannot be addressed) and fileserver's own
-in-progress temporary files (see [Writing](#writing)). Dot-prefixed and
-ignored entries are omitted because their paths are hidden protocol-wide.
-Joining `path` and an entry's `name` with `/` (or using `name` alone at the
-root), then percent-encoding each segment, forms a fetchable URL for that
-entry; directory URLs may add the optional trailing `/`. A caller walks a
-tree by reading directories as it goes.
+root. Each entry has its full root-relative `path`. A directory entry is
+exactly `{ path, kind: "dir" }`; its own `?json` listing adds `entries`.
+A symbolic-link entry is `{ path, kind: "symlink" }` with nothing about its
+target. File and symbolic-link entries match their own `?json` descriptions.
+File entries have the fields and follow the parser rule in
+[Reading](#reading). `entries` is one level deep, sorted by the last path
+segment of each entry in the default JavaScript string order. Sockets,
+devices, and other objects are omitted, as are entries whose names are not
+valid UTF-8 or contain `\` (they cannot be addressed) and temporary files
+from writes still in progress (see
+[Writing](#writing)). Dot-prefixed and ignored entries are omitted because
+their paths are hidden protocol-wide.
 
-Extensions may add entry types. A client must tolerate an unrecognized
-`type` by treating the entry as opaque rather than rejecting the listing;
-its `name` remains addressable by the rule above.
+Percent-encoding each segment of the `path` of an entry gives its URL
+relative to the root. Adding `?json` returns its description or, for a
+directory, its listing. A caller walks a tree by listing directories as it
+goes.
 
-`Range` and the conditional headers do not apply to directories. `HEAD` on
-a directory returns the listing's `Content-Type` and the exact serialised
-`Content-Length` without a body.
+Extensions may add kinds. A client must tolerate an unrecognised `kind` by
+treating the entry as opaque rather than rejecting the listing; its `path`
+remains addressable by the rule above. Added fields on a file entry also
+appear in its `?json` description.
+
+`Range` and the conditional headers do not apply to directory listings,
+which have the JSON headers stated under [Reading](#reading).
+`HEAD` on a directory URL returns the status and headers `GET` would,
+without a body. `OPTIONS` on a directory follows the ordinary preflight
+rule and does not redirect.
 
 ## Writing
 
@@ -189,6 +252,8 @@ uses, so its failure modes are ones an agent already understands. It is a
 carries no idempotency requirement — an edit that fails to re-match on a
 second application fits it. `PATCH` dispatches on the body's media type,
 so other patch documents can be added beside this one without changing it.
+A parser extension may use the existing [extension hook](#extension-seam) to
+accept `PATCH ?json` for writable keys it adds, such as Markdown frontmatter.
 
 ## Confinement
 
@@ -199,12 +264,16 @@ refused, never normalised into a different target. For a `PUT` that
 creates a new file or directories, the deepest component that already
 exists is what is resolved and checked; the rest is created beneath it.
 
-**Symbolic links are not served.** A path any of whose components is a
-symbolic link — including one whose target is inside the root — is
-`403 Forbidden` for every method, `OPTIONS` and unsupported methods
-included: the link check runs before method dispatch. Listings show a link
-as `type: "link"` (see [Directories](#directories)) so it is not invisible,
-and nothing else. Objects that are neither files nor directories are `404`
+**Symbolic-link targets are not served.** `GET` or `HEAD` with `?json` on the
+exact path of a symbolic link, without a trailing slash, returns
+`{ path, kind: "symlink" }` as a JSON description, without following the
+link or exposing its target. Every other request to a path any of whose
+components is a symbolic link — including one whose target is inside the
+root — is `403 Forbidden`. This includes `OPTIONS` and unsupported methods:
+the link check runs before method dispatch, except for the exact-link
+description. Listings show the same `{ path, kind: "symlink" }` description
+(see [Directories](#directories)).
+Objects that are neither files, directories, nor symbolic links are `404`
 for every method. Hard links and bind mounts cannot be detected by path
 resolution and are outside the boundary.
 
@@ -236,10 +305,11 @@ and its write.
 ## Change stream
 
 A WebSocket upgrade on `/`, or on any other existing directory's
-slash-terminated URL, subscribes to the same root-wide stream. The upgraded
-URL does not scope the subscription. A malformed, hidden, confined-out, or
-non-directory path refuses the upgrade under the corresponding HTTP path
-rule.
+slash-terminated URL, subscribes to the same root-wide stream, even when
+an HTTP `GET` on that URL serves `index.html` or returns `404` for a missing
+index file. The upgraded URL does not scope the subscription. A malformed,
+hidden, confined-out, or non-directory path refuses the upgrade under the
+corresponding HTTP path rule.
 
 Each text message is one JSON dirty signal:
 
@@ -275,34 +345,39 @@ WebSockets are exempt from CORS.
 
 ## CORS
 
-The shared [HTTP conventions](../index.md#http-conventions), with
-these header values on the preflight:
+The [HTTP rules](index.md#http-conventions) apply.
+[Errors](#errors) specifies when a preflight is accepted. An accepted
+preflight has these header values:
 
 ```
 Access-Control-Allow-Methods: GET, HEAD, PUT, PATCH, DELETE, OPTIONS
 Access-Control-Allow-Headers: Content-Type, Range, If-None-Match, If-Modified-Since, If-Range
-Access-Control-Expose-Headers: ETag, Accept-Ranges, Content-Range, Accept-Patch
+Access-Control-Expose-Headers: ETag, Accept-Ranges, Content-Range, Accept-Patch, Link
 Access-Control-Max-Age: 86400
 Accept-Patch: application/vnd.telepath.edit+json
 ```
 
 Non-`OPTIONS` responses carry `Access-Control-Expose-Headers` too, so
-a page can read the validators and range headers.
+a page can read the validators, range headers, and file-description link.
 
 ## Errors
 
 A method outside the set above is `405 Method Not Allowed` with
 `Allow: GET, HEAD, PUT, PATCH, DELETE, OPTIONS`, whether or not the path
-exists. Checks are applied in the order: URL syntax (`400`); hidden segments
-(`404`); symbolic links (`403`) and special objects (`404`), which therefore
-apply to every method; method (`405`, and `OPTIONS` → `204` regardless of
-existence); confinement and resource type (`404`, `409`); then the
-operation's own validation. Filesystem failures map
-`ENOENT`/`ENOTDIR` to
+exists, subject to the path checks below. Checks are applied in the order:
+URL syntax (`400`); hidden segments (`404`); symbolic links (`403`) and
+special objects (`404`), except for the exact-link `GET` or `HEAD`
+description; unsupported method (`405`) or `OPTIONS` (`204` regardless of
+existence); confinement; the extension `handle` hook; `PUT`, `PATCH`, or
+`DELETE` with `?json` not handled by an extension (`405` with
+`Allow: GET, HEAD, OPTIONS`); resource type (`404`, `409`); then the
+operation's own validation. A missing path requested with `?json` is
+`404` with the standard error body; an unknown file format still has a
+default JSON description. Filesystem failures map `ENOENT`/`ENOTDIR` to
 `404`, `EACCES`/`EPERM` to `403`, and anything unexpected to `500`.
 
 Every error response except to `HEAD` has a body: `application/json;
-charset=utf-8` in the shared [shape](../index.md#http-conventions), so
+charset=utf-8` in the [error shape](index.md#http-conventions), so
 a caller reads one shape whether the failure is a `404`, a `405`, or
 an edit's `422`. `HEAD` errors carry the same status and headers with
 no body; `204` and `304` responses have no body.
@@ -338,7 +413,7 @@ instance is held.
   `app` without calling `listen` gets the same readiness check.
 - `listen({ host?, port? })` — `host` defaults to `127.0.0.1`. With no
   `port`, it binds from the configured `defaultPort` according to the
-  [shared CLI conventions](../cli.md). With an explicit `port` it binds that
+  [CLI port rules](cli.md#options). With an explicit `port` it binds that
   port or rejects if it is in use — an explicit choice never moves.
   Port `0` binds one the operating system chooses. Rejects if the root does
   not resolve. An instance listens once; after `close`, make a new instance.
@@ -384,21 +459,24 @@ instance is held.
 
 The package exports `FileServerExtension`, `FileServerExtensionContext`,
 `DirectoryListing`, `DirectoryEntry`, and `FileChangeEvent` beside
-`FileServer`. `VaultServer` uses this seam; an extension does not replace or
-copy the base router. It handles only the deltas its own wire spec names and
+`FileServer`. An extension does not replace or copy the base router. It
+handles only the deltas its own wire spec names and
 must delegate every other request and representation unchanged.
 
 The exported wire shapes have the meanings established above:
 
-- `DirectoryListing` is `{ path, entries }`: `path` is the decoded
-  root-relative string without leading or trailing slash, empty for the root,
-  and `entries` is an array of `DirectoryEntry` values.
-- `DirectoryEntry` has a decoded `name` string and `type` string. For core
-  values it is exactly `{ name, type: "dir" }`, `{ name, type: "link" }`, or
-  `{ name, type: "file", size, modified }`, with `size` a byte count and
-  `modified` an ISO 8601 string. The type permits other type values and
-  JSON-compatible properties so an extension can add a representation
-  without making base clients reject it.
+- `DirectoryListing` is `{ path, kind: "dir", entries }`: `path` is the
+  decoded root-relative string without leading or trailing slash, empty for
+  the root, and `entries` is an array of `DirectoryEntry` values.
+- `DirectoryEntry` has a decoded full root-relative `path` string and a
+  `kind` string. For core values it is exactly `{ path, kind: "dir" }`,
+  `{ path, kind: "symlink" }`, or `{ path, kind: "file", contentType, size,
+  modified }`. `contentType` is the full `Content-Type` of the response
+  serving file bytes, `size` is a byte count, and `modified` is an ISO 8601
+  string. The type permits other kinds and JSON-compatible properties.
+  Fields added to file entries follow [Reading](#reading). A directory
+  `?json` listing has `entries` in addition to its directory entry fields,
+  as specified under [Directories](#directories).
 - `FileChangeEvent` is an object with `type` equal to `created`, `modified`,
   or `deleted`, and a decoded root-relative `path` string, exactly as in
   [Change stream](#change-stream). It has no other properties.
@@ -422,9 +500,10 @@ server awaits either form:
   immediately before serialization. `request` is the Express request, and
   `context` identifies the directory being listed. The hook returns the
   `DirectoryListing` to serialize. This is where an extension decorates
-  entries or selects a named alternate listing
-  representation. A return value that is not a valid listing is an extension
-  error and produces `500 Internal Server Error`.
+  entries or selects a named alternate listing representation. The returned
+  listing follows the [entry rules](#directories), including the relation
+  between entries and item descriptions. A return value that is not a valid
+  listing is an extension error and produces `500 Internal Server Error`.
 - `change(event): FileChangeEvent | null | Promise<FileChangeEvent | null>`
   receives a `FileChangeEvent` immediately before broadcast and returns a
   `FileChangeEvent` to publish or `null` to suppress it. The hook completes
@@ -447,10 +526,10 @@ read-only:
 - `segments` is the corresponding array of decoded path segments.
 - `trailingSlash` says whether the request path ended in `/`.
 - `resource` is the already-inspected exact resource. It is `{ type:
-  "missing" }`, `{ type: "dir" }`, or `{ type: "file", size, modified }`,
-  where `size` is bytes and `modified` is the ISO 8601 mtime. Symlinks and
-  special objects do not reach an extension hook because the base checks
-  reject them first.
+  "missing" }`, `{ type: "dir" }`, `{ type: "symlink" }`, or `{ type:
+  "file", size, modified }`, where `size` is bytes and `modified` is the
+  ISO 8601 mtime. A symlink reaches `handle` only for its exact `GET` or
+  `HEAD` `?json` description; special objects never reach the hook.
 
 The context has four awaited operations. Every `path` argument is a decoded,
 root-relative path without a leading slash; the empty string denotes the
@@ -460,8 +539,9 @@ path.
 
 - `inspect(path)` is asynchronous. It takes one path string and resolves with
   the same resource object as `resource`. Absence resolves as `{ type:
-  "missing" }`; a malformed, escaping, or inaccessible path rejects with its
-  base `400`, `403`, or `404` failure.
+  "missing" }`; an exact symbolic link resolves as `{ type: "symlink" }`
+  without following it. A malformed, escaping, or inaccessible path rejects
+  with its base `400`, `403`, or `404` failure.
 - `list(path): Promise<DirectoryListing>` takes one path string and resolves
   with the base, one-level listing for that directory. It does not call the
   extension's `listing` hook. A missing path or a path that is not a directory
@@ -482,6 +562,5 @@ including suppression of the duplicate watcher signal. An uncaught operation
 failure is mapped by the calling hook as described above; an extension that
 catches it owns the response or alternate result from that point.
 
-The base wire behavior has no other configuration: what it serves is the
-root, less any paths matching its [ignore patterns](cli.md#config), and how
-is [the server contract](server.md).
+The base wire behaviour has no other configuration beyond the root and
+[ignore patterns](cli.md#config).

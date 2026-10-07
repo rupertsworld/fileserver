@@ -62,7 +62,7 @@ export type FileServerOptions = {
   root: string;
   defaultPort?: number;
   pingIntervalMs?: number;
-  /** Patterns in .gitignore syntax; matching paths are hidden exactly like dot-prefixed ones (spec/files/cli.md#config). */
+  /** Patterns in .gitignore syntax; matching paths are hidden exactly like dot-prefixed ones (spec/cli.md#config). */
   ignore?: readonly string[];
   extension?: FileServerExtension;
 };

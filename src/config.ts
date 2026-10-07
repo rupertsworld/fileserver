@@ -1,5 +1,5 @@
-// The fileserver config file, ~/.config/fileserver/config.json (spec/cli.md#config
-// and spec/files/cli.md#config). The binary only reads it. Its one optional
+// The fileserver config file, ~/.config/fileserver/config.json
+// (spec/cli.md#config). The binary only reads it. Its one optional
 // member, `ignore`, is an array of .gitignore patterns whose paths the server
 // hides.
 //

@@ -25,7 +25,7 @@ pattern; it can be repeated. `--ignore node_modules/` hides every
 `node_modules` directory and everything inside it.
 
 Use the printed `url:` value as `<base>`. Source and full spec:
-the fileserver repository, with the contract in `spec/files/`.
+the fileserver repository, with the contract in `spec/`.
 
 ## Read files
 

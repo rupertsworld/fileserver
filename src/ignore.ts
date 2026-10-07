@@ -1,5 +1,5 @@
 // Ignore patterns: which root-relative paths the server hides because they
-// match one of its configured patterns (spec/files/cli.md#config).
+// match one of its configured patterns (spec/cli.md#config).
 //
 // Patterns follow .gitignore rules and are matched by the `ignore` package
 // without regard to letter case (its default, and how git behaves with
