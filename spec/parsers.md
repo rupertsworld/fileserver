@@ -89,7 +89,8 @@ Created` or `200 OK` for a replacement. The
 `PUT` alike.
 
 Before either structured write commits, the server parses the candidate
-bytes. A parse failure leaves the old file intact. A missing or wrong
+bytes. If the parser cannot read the bytes its own `patch` produced, the
+response is `500 Internal Server Error` and the old file is left intact. A missing or wrong
 `Content-Type` is `415 Unsupported Media Type`; a malformed JSON body or
 a top-level value that is not an object is `400 Bad Request`. Media-type
 matching is case-insensitive and permits `charset=utf-8`. A request body
