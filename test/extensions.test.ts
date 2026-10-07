@@ -74,23 +74,23 @@ test("handle runs after path, object, method, and OPTIONS checks", async (contex
   assert.equal(calls, 0);
 });
 
-test("handle can inspect an exact symlink description and accept PATCH ?json", async (context) => {
-  const root = await makeRoot({ "note.txt": "note" });
+test("handle can inspect an exact symlink description but cannot bypass parser method eligibility", async (context) => {
+  const root = await makeRoot({ "note.txt": "note", "note.md": "old" });
   await symlink("note.txt", join(root, "alias.txt"));
   const seen: Array<FileServerExtensionContext["resource"]> = [];
+  let rejectedPatchCalls = 0;
+  let delegatedPatchCalls = 0;
   const server = await new FileServer({
     root,
     extension: {
-      async handle(request, response, requestContext) {
+      async handle(request, _response, requestContext) {
         if (requestContext.path === "alias.txt") {
           seen.push(requestContext.resource);
           assert.deepEqual(await requestContext.inspect("alias.txt"), { type: "symlink" });
           return false;
         }
-        if (request.method === "PATCH" && requestContext.path === "note.txt" && request.url.includes("?json")) {
-          response.status(204).end();
-          return true;
-        }
+        if (request.method === "PATCH" && requestContext.path === "note.txt" && request.url.includes("?json")) rejectedPatchCalls += 1;
+        if (request.method === "PATCH" && requestContext.path === "note.md" && request.url.includes("?json")) delegatedPatchCalls += 1;
         return false;
       },
     },
@@ -101,7 +101,15 @@ test("handle can inspect an exact symlink description and accept PATCH ?json", a
   assert.equal((await fetch(`${server.url}/alias.txt?json`, { method: "HEAD" })).status, 200);
   assert.deepEqual(seen, [{ type: "symlink" }, { type: "symlink" }]);
   assert.equal((await fetch(`${server.url}/alias.txt?json`, { method: "PATCH" })).status, 403);
-  assert.equal((await fetch(`${server.url}/note.txt?json`, { method: "PATCH" })).status, 204);
+  assert.equal((await fetch(`${server.url}/note.txt?json`, { method: "PATCH" })).status, 405);
+  assert.equal(rejectedPatchCalls, 0);
+  assert.equal((await fetch(`${server.url}/note.md?json`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/merge-patch+json" },
+    body: JSON.stringify({ body: "new" }),
+  })).status, 200);
+  assert.equal(delegatedPatchCalls, 1);
+  assert.equal(await (await fetch(`${server.url}/note.md`)).text(), "new");
   const refused = await fetch(`${server.url}/note.txt?json`, { method: "DELETE" });
   assert.equal(refused.status, 405);
   assert.equal(refused.headers.get("allow"), "GET, HEAD, OPTIONS");

@@ -54,6 +54,16 @@ the response is the full `200` description with no file validators. `HEAD`
 with `?json` returns the same headers, including the exact JSON byte length,
 without a body.
 
+By default, `.md` files also have `frontmatter`, a YAML map represented as a
+JSON object, and `body`, the text following that map. Files without
+frontmatter have `frontmatter: {}` and their whole text as `body`. Malformed
+frontmatter leaves the whole text in `body`, sets `frontmatter: {}`, and adds
+`frontmatterError`. A file the parser cannot read has only the five default
+fields and a `parseError` string instead; invalid UTF-8 in a `.md` file is
+one cause. Read the byte URL to get the unchanged file, even when parsing
+fails. Other file types may expose other parsed fields, so use fields only
+when they are present.
+
 ## Walk directories
 
 `GET <base>/<dir>/` serves a visible `index.html` if one exists. Otherwise it
@@ -79,7 +89,8 @@ The root `/` is already slash-terminated.
 Each entry has a full root-relative `path`. Encode its segments to form a URL
 relative to `<base>`. Fetch `dir` entries with `?json` as you walk the tree;
 directory entries have no nested `entries` until fetched. File and symlink
-entries match their own `?json` descriptions. A symlink description is
+entries match their own `?json` descriptions, including parser fields and
+parse errors on file entries. A symlink description is
 readable at its exact path with `?json`, but its target is never served and
 other requests through the link return `403`. Treat an unrecognized `kind`
 as opaque rather than rejecting the listing. Its `path` remains addressable.
@@ -91,6 +102,50 @@ as opaque rather than rejecting the listing. Its `path` remains addressable.
   directories.
 - `DELETE <base>/<path>` removes a file or a whole directory tree (`204`). The
   served root cannot be deleted.
+
+When an agent or artifact creates a file, send `If-None-Match: *` on the
+`PUT`. It makes both byte and structured `PUT` create only. If the path
+already exists, including when a competing creation wins first, the server
+returns `412` and keeps that file.
+
+## Write parsed fields
+
+For a file extension with a writable parser, `PUT <base>/<path>?json` with
+`Content-Type: application/json` and a top-level object creates or replaces
+the file from parsed fields. It creates missing parent directories and
+returns the new description as JSON (`201` for creation, `200` for
+replacement). The five default fields are ignored, so a fetched description
+can be submitted after changing its editable fields. For Markdown, send a
+`frontmatter` object and `body` string; omitted values become `{}` and `""`.
+`frontmatterError` is ignored on Markdown `PUT`. A supplied `null` or wrong
+type for `frontmatter` or `body`, or an unknown key, returns `422`.
+
+`PATCH <base>/<path>?json` with
+`Content-Type: application/merge-patch+json` and a top-level object changes
+parsed fields of an existing file. It returns the new description as JSON
+(`200`). On Markdown files, `frontmatter` merges by key: `null` removes a
+key, arrays replace whole arrays, and `frontmatter: null` removes the map.
+`body` replaces the text after the frontmatter; `body: null` removes that
+text. An absent field stays unchanged. An empty patch returns the current
+description without writing. A missing file returns `404`; a default,
+unknown, or otherwise unwritable field returns `422`. For Markdown,
+`frontmatterError` is unwritable on `PATCH`. A frontmatter patch keeps
+comments, key order, and untouched formatting as the YAML document library
+preserves them; exact byte preservation is not guaranteed. A non-empty
+Markdown patch to invalid UTF-8 returns `422`. Parser rejection also returns `422` with
+the parser error message.
+
+A writable `?json` address advertises
+`Allow: GET, HEAD, PUT, PATCH, OPTIONS` and
+`Accept-Patch: application/merge-patch+json`. Other `?json` addresses
+advertise `Allow: GET, HEAD, OPTIONS` without `Accept-Patch`, and reject
+`PUT` or `PATCH` with `405`. `OPTIONS` repeats the applicable methods in
+`Access-Control-Allow-Methods`. Structured writes require the stated
+media type (`415` otherwise); malformed JSON or a non-object body is
+`400`. The request body and resulting file are each limited to 16 MiB
+(`413`); `PATCH` on a file over 16 MiB is `415`. A rejected write leaves
+the old file intact and emits no change signal. If a parser cannot read
+bytes it produced, the response is `500`.
 
 ## Edit text
 
@@ -136,9 +191,7 @@ Surface the message instead of swallowing it.
 There is no authentication. Dot-prefixed paths, paths matching the server's
 ignore patterns, and anything above the served directory are unreachable: they
 return `404` and are absent from listings and change signals.
-`PUT`, `PATCH`, and `DELETE` requests with `?json` return `405` with
-`Allow: GET, HEAD, OPTIONS` after path checks. Write to the path without
-`?json`.
-Concurrent mutations are last-write-wins. Read before editing. Treat a
-`422` from `PATCH` as a sign that the file may have changed: re-read it and
-retry the anchored edit instead of forcing a replacement.
+After path checks, `DELETE` with `?json` returns `405`; delete at the byte
+address. Except for create-only `PUT`, concurrent writes are last-write-wins.
+Read before editing. If an anchored edit returns `422` because its match is
+gone, re-read before retrying. Surface other `422` errors.

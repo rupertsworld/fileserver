@@ -91,6 +91,8 @@ export function defineReadingConformance(factory: FileServerConformanceFactory):
         contentType: "text/markdown; charset=utf-8",
         size: 6,
         modified: "2026-01-02T03:04:05.000Z",
+        frontmatter: {},
+        body: "coffee",
       }, query);
       const head = await fetch(`${running.baseUrl}${path}${query}`, { method: "HEAD", headers: { "if-none-match": "*", range: "bytes=0-1" } });
       assert.equal(head.status, 200, query);

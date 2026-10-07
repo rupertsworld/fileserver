@@ -160,7 +160,7 @@ export function parseRawResponse(response: Buffer): { status: number; headers: R
   return { status, headers, body: response.subarray(separator + 4) };
 }
 
-export function beginUpload(baseUrl: string, path: string, contentLength: number): {
+export function beginUpload(baseUrl: string, path: string, contentLength: number, headers: Record<string, string> = {}): {
   request: ClientRequest;
   response: Promise<RawResponse>;
 } {
@@ -172,7 +172,7 @@ export function beginUpload(baseUrl: string, path: string, contentLength: number
       port: base.port,
       method: "PUT",
       path,
-      headers: { "content-length": String(contentLength) },
+      headers: { "content-length": String(contentLength), ...headers },
     }, (incoming) => {
       const chunks: Buffer[] = [];
       incoming.on("data", (chunk: Buffer) => chunks.push(chunk));

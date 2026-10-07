@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 const run = promisify(execFile);
 
-test("npm package ships the bundled skill and built conformance subpath", async (context) => {
+test("npm package ships the bundled skill, conformance suite, and Markdown parser", async (context) => {
   const cache = await mkdtemp(join(tmpdir(), "file-server-npm-cache-"));
   context.after(() => rm(cache, { recursive: true, force: true }));
   const { stdout } = await run("npm", ["pack", "--dry-run", "--json", "--ignore-scripts", "--cache", cache], {
@@ -19,6 +19,8 @@ test("npm package ships the bundled skill and built conformance subpath", async 
   assert(files.has("skill/SKILL.md"));
   assert(files.has("dist/src/conformance/index.js"));
   assert(files.has("dist/src/conformance/index.d.ts"));
+  assert(files.has("dist/src/parsers/markdown.js"));
+  assert(files.has("dist/src/parsers/markdown.d.ts"));
   for (const concern of [
     "changes",
     "confinement",
@@ -27,6 +29,7 @@ test("npm package ships the bundled skill and built conformance subpath", async 
     "editing",
     "errors",
     "helpers",
+    "parsers",
     "reading",
     "types",
     "url-mapping",
@@ -37,6 +40,10 @@ test("npm package ships the bundled skill and built conformance subpath", async 
   const subpath: string = "@rupertsworld/fileserver/conformance";
   const conformance = await import(subpath) as { defineFileServerConformance?: unknown };
   assert.equal(typeof conformance.defineFileServerConformance, "function");
+  const markdownSubpath: string = "@rupertsworld/fileserver/parsers/markdown";
+  const markdown = await import(markdownSubpath) as { parse?: unknown; patch?: unknown };
+  assert.equal(typeof markdown.parse, "function");
+  assert.equal(typeof markdown.patch, "function");
 });
 
 test("bundled skill teaches descriptions, directory URLs, and live refetch", async () => {
@@ -60,6 +67,14 @@ test("bundled skill teaches descriptions, directory URLs, and live refetch", asy
   assert.match(skill, /307/);
   assert.match(skill, /405/);
   assert.match(skill, /Allow: GET, HEAD, OPTIONS/);
+  assert.match(skill, /`frontmatter`/);
+  assert.match(skill, /`body`/);
+  assert.match(skill, /`frontmatterError`/);
+  assert.match(skill, /`parseError`/);
+  assert.match(skill, /application\/merge-patch\+json/);
+  assert.match(skill, /`PUT <base>\/<path>\?json`/);
+  assert.match(skill, /`PATCH <base>\/<path>\?json`/);
+  assert.match(skill, /When an agent or artifact creates a file, send `If-None-Match: \*`/);
 });
 
 test("published extension declarations include their Express type dependency", async () => {
@@ -95,12 +110,16 @@ test("a clean TypeScript consumer can compile against the packed public declarat
   await writeFile(join(consumer, "consumer.ts"), `
 import {
   FileServer,
+  type FileParser,
   type DirectoryListing,
   type FileChangeEvent,
   type FileServerExtension,
   type FileServerExtensionContext,
 } from "@rupertsworld/fileserver";
 import { defineFileServerConformance } from "@rupertsworld/fileserver/conformance";
+import * as markdown from "@rupertsworld/fileserver/parsers/markdown";
+
+const parser: FileParser = markdown;
 
 const extension: FileServerExtension = {
   handle(_request, _response, context: FileServerExtensionContext) {
@@ -111,6 +130,7 @@ const extension: FileServerExtension = {
 };
 void new FileServer({ root: ".", defaultPort: 4747, extension });
 void defineFileServerConformance;
+void parser;
 `);
   await writeFile(join(consumer, "tsconfig.json"), JSON.stringify({
     compilerOptions: {

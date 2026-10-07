@@ -97,8 +97,10 @@ export function defineErrorsConformance(factory: FileServerConformanceFactory): 
     }
   });
 
-  test("file-server conformance: writes to JSON descriptions return a restricted 405", async (context) => {
-    const running = await startFixture(context, factory, { "file.txt": "file", "dir/child.txt": "child", ".hidden": "hidden" });
+  test("file-server conformance: JSON method eligibility follows the parser and path checks", async (context) => {
+    const running = await startFixture(context, factory, {
+      "file.txt": "file", "dir/child.txt": "child", "writable.md": "body", ".hidden": "hidden",
+    });
     await symlink("file.txt", join(running.root, "link.txt"));
     for (const path of ["/file.txt?json", "/dir?json", "/missing?json", "/file.txt?json=anything"]) {
       for (const method of ["PUT", "PATCH", "DELETE"]) {
@@ -107,6 +109,12 @@ export function defineErrorsConformance(factory: FileServerConformanceFactory): 
         assert.equal(response.headers.get("allow"), "GET, HEAD, OPTIONS", `${method} ${path}`);
         assert.deepEqual(await response.json(), { error: "method not allowed" }, `${method} ${path}`);
       }
+    }
+    for (const path of ["/writable.md?json", "/new.md?json", "/writable.md?json=anything"]) {
+      const response = await fetch(`${running.baseUrl}${path}`, { method: "DELETE" });
+      assert.equal(response.status, 405, path);
+      assert.equal(response.headers.get("allow"), "GET, HEAD, PUT, PATCH, OPTIONS", path);
+      assert.equal(response.headers.get("accept-patch"), "application/merge-patch+json", path);
     }
     for (const [path, status] of [["/.hidden?json", 404], ["/link.txt?json", 403], ["/bad%2Fpath?json", 400]] as const) {
       for (const method of ["PUT", "PATCH", "DELETE"]) {

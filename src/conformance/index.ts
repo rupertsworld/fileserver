@@ -4,6 +4,7 @@ import { defineCorsConformance } from "./cors.ts";
 import { defineDirectoriesConformance } from "./directories.ts";
 import { defineEditingConformance } from "./editing.ts";
 import { defineErrorsConformance } from "./errors.ts";
+import { defineParsersConformance } from "./parsers.ts";
 import { defineReadingConformance } from "./reading.ts";
 import type { FileServerConformanceFactory } from "./types.js";
 import { defineUrlMappingConformance } from "./url-mapping.ts";
@@ -19,6 +20,7 @@ export type {
 export function defineFileServerConformance(factory: FileServerConformanceFactory): void {
   defineUrlMappingConformance(factory);
   defineReadingConformance(factory);
+  defineParsersConformance(factory);
   defineDirectoriesConformance(factory);
   defineWritingConformance(factory);
   defineEditingConformance(factory);

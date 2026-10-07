@@ -30,7 +30,43 @@ test("concurrent PUTs use distinct temporary files and commit one complete body"
   assert.deepEqual(await readdir(root), ["race.txt"]);
 });
 
-function beginUpload(baseUrl: string, path: string, contentLength: number): {
+test("If-None-Match star makes byte PUT create-only, while other values are ignored", async () => {
+  const { baseUrl, root } = await startFileServer({ "present.txt": "original" });
+  const refused = await fetch(`${baseUrl}/present.txt`, {
+    method: "PUT",
+    headers: { "If-None-Match": "*" },
+    body: "replacement",
+  });
+  assert.equal(refused.status, 412);
+  assert.equal(await readFile(`${root}/present.txt`, "utf8"), "original");
+
+  const allowed = await fetch(`${baseUrl}/present.txt`, {
+    method: "PUT",
+    headers: { "If-None-Match": 'W/"not-current"' },
+    body: "replacement",
+  });
+  assert.equal(allowed.status, 204);
+  assert.equal(await readFile(`${root}/present.txt`, "utf8"), "replacement");
+});
+
+test("two byte PUTs that start before either commits cannot both create the same file", async (context) => {
+  const { baseUrl, root } = await startFileServer();
+  const bodies = [Buffer.from("first complete body"), Buffer.from("second complete body")];
+  const uploads = bodies.map((body) => beginUpload(baseUrl, "/race.txt", body.length, { "If-None-Match": "*" }));
+  context.after(() => uploads.forEach(({ request }) => request.destroy()));
+
+  for (const [index, upload] of uploads.entries()) upload.request.write(bodies[index]!.subarray(0, 1));
+  await waitForTemporaryCount(root, 2);
+  for (const [index, upload] of uploads.entries()) upload.request.end(bodies[index]!.subarray(1));
+
+  const responses = await Promise.all(uploads.map(({ response }) => response));
+  assert.deepEqual(responses.map(({ status }) => status).sort(), [201, 412]);
+  const stored = await readFile(`${root}/race.txt`);
+  assert.equal(bodies.some((body) => body.equals(stored)), true);
+  assert.deepEqual(await readdir(root), ["race.txt"]);
+});
+
+function beginUpload(baseUrl: string, path: string, contentLength: number, headers: Record<string, string> = {}): {
   request: ClientRequest;
   response: Promise<{ status: number; headers: IncomingHttpHeaders; body: Buffer }>;
 } {
@@ -42,7 +78,7 @@ function beginUpload(baseUrl: string, path: string, contentLength: number): {
       port: base.port,
       method: "PUT",
       path,
-      headers: { "content-length": String(contentLength) },
+      headers: { "content-length": String(contentLength), ...headers },
     }, (incoming) => {
       const chunks: Buffer[] = [];
       incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -78,4 +114,12 @@ async function waitForTemporaryName(root: string): Promise<string> {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("temporary file did not appear");
+}
+
+async function waitForTemporaryCount(root: string, count: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await readdir(root)).length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`${count} temporary files did not appear`);
 }

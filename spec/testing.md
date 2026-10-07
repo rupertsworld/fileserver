@@ -33,7 +33,8 @@ The tests cover:
   listings, with one parse per path and modification time.
 - Markdown: valid, absent, and malformed frontmatter; `frontmatterError`;
   the `parseError` fallback for invalid UTF-8 in both single-file reads
-  and listings, and `422` for a `PATCH ?json` to such a file;
+  and listings, `422` for a non-empty `PATCH ?json` to such a file, and `200`
+  for an empty one;
   frontmatter patches that remove null-valued keys, replace arrays, and
   keep comments, key order, and untouched formatting as the `yaml`
   document library preserves them; body replacements, unknown-key

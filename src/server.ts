@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { constants, type Dirent, type Stats } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir, realpath, rename, rm, stat, unlink, utimes, type FileHandle } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readdir, realpath, rename, rm, stat, unlink, utimes, type FileHandle } from "node:fs/promises";
 import { createServer, STATUS_CODES, type IncomingMessage, type Server } from "node:http";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { Readable, type Duplex } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { TextDecoder } from "node:util";
@@ -12,20 +12,31 @@ import mimeTypes from "mime-types";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { IgnorePatterns } from "./ignore.ts";
+import * as markdown from "./parsers/markdown.ts";
 
 const supportedMethods = new Set(["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"]);
 const allowedMethods = [...supportedMethods].join(", ");
 const allowedRequestHeaders = "Content-Type, Range, If-None-Match, If-Modified-Since, If-Range";
 const exposedResponseHeaders = "ETag, Accept-Ranges, Content-Range, Accept-Patch, Link";
 const editContentType = "application/vnd.telepath.edit+json";
+const mergePatchContentType = "application/merge-patch+json";
 const jsonContentType = "application/json; charset=utf-8";
 const maximumEditBytes = 16_777_216;
+const defaultFileKeys = new Set(["path", "kind", "contentType", "size", "modified"]);
+const readOnlyJsonMethods = "GET, HEAD, OPTIONS";
+const writableJsonMethods = "GET, HEAD, PUT, PATCH, OPTIONS";
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const watcherDebounceMs = 50;
 const watcherSuppressionMs = 1_000;
 const defaultPortRangeWidth = 100;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+/** A format-specific reader and optional writer for JSON file descriptions. */
+export type FileParser = {
+  parse(input: { path: string; bytes: Uint8Array }): Record<string, JsonValue> | Promise<Record<string, JsonValue>>;
+  patch?(input: { path: string; bytes?: Uint8Array; changes: Record<string, JsonValue> }): Uint8Array | Promise<Uint8Array>;
+};
 
 /** One addressable item in a one-level directory listing. */
 export type DirectoryEntry = {
@@ -66,6 +77,8 @@ export type FileServerOptions = {
   pingIntervalMs?: number;
   /** Patterns in .gitignore syntax; matching paths are hidden exactly like dot-prefixed ones (spec/cli.md#config). */
   ignore?: readonly string[];
+  /** Extension-to-parser map; omitted selects the built-in Markdown parser. */
+  parsers?: Record<string, FileParser>;
   extension?: FileServerExtension;
 };
 export type ListenOptions = { host?: string; port?: number };
@@ -110,6 +123,8 @@ export class FileServer {
   private closeCompletion: Promise<void> | undefined;
   private readonly temporaryPaths = new Set<string>();
   private readonly extension: FileServerExtension | undefined;
+  private parsers = new Map<string, FileParser>();
+  private readonly parsedFileCache = new Map<string, { modifiedMs: number; fields: Promise<Record<string, JsonValue>> }>();
   private readonly defaultPort: number;
   private readonly ignorePatterns: IgnorePatterns;
   private watcher: FSWatcher | undefined;
@@ -123,13 +138,13 @@ export class FileServer {
   private readonly suppressedDeletedSubtrees = new Map<string, SuppressedDeletedSubtree>();
   private readonly pingTimer: ReturnType<typeof setInterval>;
 
-  constructor({ root, defaultPort = 8765, pingIntervalMs = 30_000, ignore = [], extension }: FileServerOptions) {
+  constructor({ root, defaultPort = 8765, pingIntervalMs = 30_000, ignore = [], parsers, extension }: FileServerOptions) {
     this.extension = extension;
     this.defaultPort = defaultPort;
     this.ignorePatterns = new IgnorePatterns(ignore);
     this.app = express();
     this.app.disable("x-powered-by");
-    this.ready = this.initialize(root);
+    this.ready = this.initialize(root, parsers);
     void this.ready.catch(() => {});
     this.app.use(async (request, response) => {
       setCommonCorsHeaders(response);
@@ -169,7 +184,8 @@ export class FileServer {
     return address !== null && typeof address === "object" ? address.port : undefined;
   }
 
-  private async initialize(root: string): Promise<void> {
+  private async initialize(root: string, parserOptions: Record<string, FileParser> | undefined): Promise<void> {
+    this.parsers = validateParsers(parserOptions ?? { ".md": markdown });
     const resolvedRoot = await resolveRoot(root);
     this.resolvedRoot = resolvedRoot;
     // Chokidar never watches a path this callback returns true for, and never
@@ -306,6 +322,11 @@ export class FileServer {
     const root = this.resolvedRoot as string;
     const inspected = await inspectPath(root, parsed.segments);
     const wantsJson = hasJsonQuery(request.url);
+    const parser = this.parserFor(parsed.path);
+    const writableJson = wantsJson && !parsed.trailingSlash
+      && (inspected.missing || inspected.stats?.isFile() === true)
+      && parser?.patch !== undefined;
+    const methods = wantsJson ? (writableJson ? writableJsonMethods : readOnlyJsonMethods) : allowedMethods;
 
     // An exact link has one safe representation. All other requests must be
     // refused before method dispatch, including OPTIONS and unknown methods.
@@ -315,22 +336,28 @@ export class FileServer {
       return;
     }
 
+    if (wantsJson) {
+      response.set("Allow", methods);
+      if (writableJson) response.set("Accept-Patch", mergePatchContentType);
+    }
+
     if (!isSupportedMethod(request.method)) {
-      response.set("Allow", allowedMethods);
+      response.set("Allow", methods);
       sendError(request, response, 405, "method not allowed");
       return;
     }
-    if (request.method === "OPTIONS") { sendOptions(response, request); return; }
+    if (request.method === "OPTIONS") { sendOptions(response, request, methods, wantsJson); return; }
 
     await ensureConfined(root, inspected.deepestExistingPath);
     if (this.temporaryPaths.has(inspected.absolutePath)) { sendError(request, response, 404, "not found"); return; }
-    const extensionContext = this.createExtensionContext(parsed, inspected);
-    if (this.extension?.handle !== undefined && await runHandleHook(this.extension.handle, request, response, extensionContext)) return;
-    if (wantsJson && (request.method === "PUT" || request.method === "PATCH" || request.method === "DELETE")) {
-      response.set("Allow", "GET, HEAD, OPTIONS");
+    if (wantsJson && (request.method === "DELETE" || ((request.method === "PUT" || request.method === "PATCH") && !writableJson))) {
       sendError(request, response, 405, "method not allowed");
       return;
     }
+    const extensionContext = this.createExtensionContext(parsed, inspected);
+    if (this.extension?.handle !== undefined && await runHandleHook(this.extension.handle, request, response, extensionContext)) return;
+    if (wantsJson && request.method === "PUT") { await this.putJson(request, response, parsed, inspected, parser as FileParser); return; }
+    if (wantsJson && request.method === "PATCH") { await this.patchJson(request, response, parsed, inspected, parser as FileParser); return; }
     if (request.method === "PUT") { await this.put(request, response, parsed, inspected); return; }
     if (request.method === "PATCH") { await this.patch(request, response, parsed, inspected); return; }
     if (request.method === "DELETE") { await this.delete(request, response, parsed, inspected); return; }
@@ -345,7 +372,7 @@ export class FileServer {
     if (inspected.stats.isFile()) {
       if (parsed.trailingSlash) { sendError(request, response, 404, "not found"); return; }
       if (wantsJson) {
-        sendJsonDescription(request, response, fileDescription(parsed.path, inspected.absolutePath, inspected.stats));
+        sendJsonDescription(request, response, await this.describeFile(parsed.path, inspected.absolutePath, inspected.stats));
         return;
       }
       await sendFile(request, response, inspected.absolutePath);
@@ -353,7 +380,7 @@ export class FileServer {
     }
     if (inspected.stats.isDirectory()) {
       if (wantsJson) {
-        let listing = await readDirectoryListing(inspected.absolutePath, parsed.path, this.temporaryPaths, this.ignorePatterns);
+        let listing = await this.listDirectory(inspected.absolutePath, parsed.path);
         if (this.extension?.listing !== undefined) {
           try { listing = await this.extension.listing(request, listing, extensionContext); }
           catch (error) { throw mapExtensionHookError(error); }
@@ -375,6 +402,32 @@ export class FileServer {
     sendError(request, response, 404, "not found");
   }
 
+  private parserFor(path: string): FileParser | undefined {
+    return this.parsers.get(extname(path).toLowerCase());
+  }
+
+  private async describeFile(path: string, absolutePath: string, stats: Stats): Promise<DirectoryEntry> {
+    const defaults = fileDescription(path, absolutePath, stats);
+    const parser = this.parserFor(path);
+    if (parser === undefined) return defaults;
+    let cached = this.parsedFileCache.get(path);
+    if (cached === undefined || cached.modifiedMs !== stats.mtimeMs) {
+      const fields = (async () => {
+        const handle = await open(absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try { return await parseFields(parser, path, await handle.readFile()); }
+        finally { await handle.close().catch(() => undefined); }
+      })();
+      cached = { modifiedMs: stats.mtimeMs, fields };
+      this.parsedFileCache.set(path, cached);
+    }
+    return { ...defaults, ...await cached.fields };
+  }
+
+  private async listDirectory(absolutePath: string, path: string): Promise<DirectoryListing> {
+    return readDirectoryListing(absolutePath, path, this.temporaryPaths, this.ignorePatterns,
+      (entryPath, entryAbsolutePath, stats) => this.describeFile(entryPath, entryAbsolutePath, stats));
+  }
+
   private async sendDirectoryIndex(request: Request, response: Response, directory: ParsedPath): Promise<void> {
     const segments = [...directory.segments, "index.html"];
     const parsed: ParsedPath = { segments, path: segments.join("/"), trailingSlash: false };
@@ -393,13 +446,92 @@ export class FileServer {
   private async put(request: Request, response: Response, parsed: ParsedPath, inspected: InspectedPath): Promise<void> {
     if (parsed.trailingSlash) { sendError(request, response, 409, "cannot write a directory path"); return; }
     if (inspected.stats?.isDirectory()) { sendError(request, response, 409, "cannot replace a directory"); return; }
+    const createOnly = request.get("If-None-Match")?.trim() === "*";
+    if (createOnly && !inspected.missing) { sendError(request, response, 412, "file already exists"); return; }
     const result = await this.replacePath(
       inspected.absolutePath,
       inspected.stats,
       parsed.path,
       request,
+      createOnly,
     );
-    response.status(result === "created" ? 201 : 204).end();
+    response.status(result.result === "created" ? 201 : 204).end();
+  }
+
+  private async putJson(request: Request, response: Response, parsed: ParsedPath, inspected: InspectedPath, parser: FileParser): Promise<void> {
+    if (inspected.stats?.isDirectory()) { sendError(request, response, 409, "cannot replace a directory"); return; }
+    const createOnly = request.get("If-None-Match")?.trim() === "*";
+    if (createOnly && !inspected.missing) { sendError(request, response, 412, "file already exists"); return; }
+    const document = await this.readStructuredBody(request, response, "application/json");
+    if (document === undefined) return;
+    const changes = Object.fromEntries(Object.entries(document).filter(([key]) => !defaultFileKeys.has(key)));
+    const bytes = await patchBytes(parser, { path: parsed.path, changes });
+    if (bytes.length > maximumEditBytes) { sendError(request, response, 413, "result is too large"); return; }
+    const fields = await parseFields(parser, parsed.path, bytes);
+    if (Object.hasOwn(fields, "parseError")) throw new HttpError(500, "parser could not read its output");
+    const written = await this.replacePath(inspected.absolutePath, inspected.stats, parsed.path, Readable.from([bytes]), createOnly);
+    this.parsedFileCache.set(parsed.path, { modifiedMs: written.stats.mtimeMs, fields: Promise.resolve(fields) });
+    sendJsonDescription(request, response,
+      { ...fileDescription(parsed.path, inspected.absolutePath, written.stats), ...fields },
+      written.result === "created" ? 201 : 200);
+  }
+
+  private async patchJson(request: Request, response: Response, parsed: ParsedPath, inspected: InspectedPath, parser: FileParser): Promise<void> {
+    if (inspected.missing || inspected.stats === undefined) { sendError(request, response, 404, "not found"); return; }
+    if (!inspected.stats.isFile()) { sendError(request, response, 409, "cannot edit a directory"); return; }
+    if (inspected.stats.size > maximumEditBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
+    const changes = await this.readStructuredBody(request, response, mergePatchContentType);
+    if (changes === undefined) return;
+    if (Object.keys(changes).some((key) => defaultFileKeys.has(key))) {
+      sendError(request, response, 422, "default fields cannot be changed"); return;
+    }
+    if (Object.keys(changes).length === 0) {
+      sendJsonDescription(request, response, await this.describeFile(parsed.path, inspected.absolutePath, inspected.stats));
+      return;
+    }
+
+    const handle = await open(inspected.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let stats: Stats;
+    let sourceBytes: Buffer;
+    try {
+      stats = await handle.stat();
+      if (stats.size > maximumEditBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
+      sourceBytes = await readHandleAtMost(handle, maximumEditBytes + 1);
+      if (sourceBytes.length > maximumEditBytes) { sendError(request, response, 415, "target is too large to edit"); return; }
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+    const bytes = await patchBytes(parser, { path: parsed.path, bytes: sourceBytes, changes });
+    if (bytes.length > maximumEditBytes) { sendError(request, response, 413, "result is too large"); return; }
+    const fields = await parseFields(parser, parsed.path, bytes);
+    if (Object.hasOwn(fields, "parseError")) throw new HttpError(500, "parser could not read its output");
+    const writtenStats = await writeAtomically(inspected.absolutePath, Readable.from([bytes]),
+      stats.mode & 0o7777, stats.mtime.getTime(), this.temporaryPaths);
+    await this.publishMutation({ type: "modified", path: parsed.path }, inspected.absolutePath);
+    this.parsedFileCache.set(parsed.path, { modifiedMs: writtenStats.mtimeMs, fields: Promise.resolve(fields) });
+    sendJsonDescription(request, response,
+      { ...fileDescription(parsed.path, inspected.absolutePath, writtenStats), ...fields });
+  }
+
+  private async readStructuredBody(request: Request, response: Response, contentType: string): Promise<Record<string, JsonValue> | undefined> {
+    if (!matchesContentType(request.get("Content-Type"), contentType)) {
+      sendError(request, response, 415, "unsupported media type"); return undefined;
+    }
+    const declaredLength = request.headers["content-length"];
+    if (typeof declaredLength === "string" && Number(declaredLength) > maximumEditBytes) {
+      rejectOversizedRequestBody(request, response); return undefined;
+    }
+    let body: Buffer;
+    try { body = await readLimitedBody(request, maximumEditBytes); }
+    catch (error) {
+      if (error instanceof HttpError && error.status === 413) { rejectOversizedRequestBody(request, response); return undefined; }
+      throw error;
+    }
+    let value: unknown;
+    try { value = JSON.parse(utf8Decoder.decode(body)); }
+    catch { sendError(request, response, 400, "malformed JSON body"); return undefined; }
+    if (!isJsonObject(value)) { sendError(request, response, 400, "JSON body must be an object"); return undefined; }
+    return value as Record<string, JsonValue>;
   }
 
   private async patch(request: Request, response: Response, parsed: ParsedPath, inspected: InspectedPath): Promise<void> {
@@ -490,7 +622,7 @@ export class FileServer {
       list: (path: string) => runContextOperation(async () => {
         const resolved = await this.resolveContextPath(path);
         if (resolved.inspected.missing || resolved.inspected.stats?.isDirectory() !== true) throw new HttpError(404, "not found");
-        return readDirectoryListing(resolved.inspected.absolutePath, resolved.parsed.path, this.temporaryPaths, this.ignorePatterns);
+        return this.listDirectory(resolved.inspected.absolutePath, resolved.parsed.path);
       }),
       replace: (path: string, bytes: Uint8Array | Readable) => runContextOperation(async () => {
         const parsedPath = await this.parseContextTarget(path);
@@ -498,12 +630,12 @@ export class FileServer {
         const resolved = await this.resolveParsedPath(parsedPath);
         if (resolved.inspected.stats?.isDirectory()) throw new HttpError(409, "cannot replace a directory");
         const source = bytes instanceof Readable ? bytes : Readable.from([bytes]);
-        return this.replacePath(
+        return (await this.replacePath(
           resolved.inspected.absolutePath,
           resolved.inspected.stats,
           parsedPath.path,
           source,
-        );
+        )).result;
       }),
       remove: (path: string) => runContextOperation(async () => {
         const parsedPath = await this.parseContextTarget(path);
@@ -521,23 +653,25 @@ export class FileServer {
     stats: Stats | undefined,
     path: string,
     source: Readable,
-  ): Promise<"created" | "replaced"> {
+    createOnly = false,
+  ): Promise<{ result: "created" | "replaced"; stats: Stats }> {
     const existingFileStats = stats?.isFile() === true ? stats : undefined;
     try { await mkdir(dirname(absolutePath), { recursive: true }); }
     catch (error) {
       if (hasErrorCode(error, "EEXIST")) throw new HttpError(404, "not found");
       throw error;
     }
-    await writeAtomically(
+    const writtenStats = await writeAtomically(
       absolutePath,
       source,
       existingFileStats === undefined ? undefined : existingFileStats.mode & 0o7777,
       existingFileStats?.mtime.getTime(),
       this.temporaryPaths,
+      createOnly,
     );
     const result = existingFileStats === undefined ? "created" : "replaced";
     await this.publishMutation({ type: result === "created" ? "created" : "modified", path }, absolutePath);
-    return result;
+    return { result, stats: writtenStats };
   }
 
   private async removePath(absolutePath: string, stats: Stats, path: string): Promise<void> {
@@ -597,6 +731,7 @@ export class FileServer {
   }
 
   private async publishMutation(event: FileChangeEvent, absolutePath: string): Promise<void> {
+    this.parsedFileCache.delete(event.path);
     if (event.type !== "deleted") this.advanceDeletedSuppressions(absolutePath);
     await this.suppressWatcherEvent(event, absolutePath);
     if (event.type === "created") {
@@ -1255,10 +1390,10 @@ async function streamFile(handle: FileHandle, response: Response, start?: number
   });
 }
 
-function sendJsonDescription(request: Request, response: Response, description: DirectoryListing | DirectoryEntry): void {
+function sendJsonDescription(request: Request, response: Response, description: DirectoryListing | DirectoryEntry, status = 200): void {
   const body = Buffer.from(JSON.stringify(description));
   response.set({ "Content-Type": jsonContentType, "Content-Length": String(body.length) });
-  response.status(200);
+  response.status(status);
   if (request.method === "HEAD") response.end();
   else response.end(body);
 }
@@ -1268,8 +1403,9 @@ async function readDirectoryListing(
   path: string,
   temporaryPaths: ReadonlySet<string>,
   ignorePatterns: IgnorePatterns,
+  describeFile: (path: string, absolutePath: string, stats: Stats) => Promise<DirectoryEntry>,
 ): Promise<DirectoryListing> {
-  return { path, kind: "dir", entries: await readDirectoryEntries(absolutePath, path, temporaryPaths, ignorePatterns) };
+  return { path, kind: "dir", entries: await readDirectoryEntries(absolutePath, path, temporaryPaths, ignorePatterns, describeFile) };
 }
 
 async function readDirectoryEntries(
@@ -1277,6 +1413,7 @@ async function readDirectoryEntries(
   path: string,
   temporaryPaths: ReadonlySet<string>,
   ignorePatterns: IgnorePatterns,
+  describeFile: (path: string, absolutePath: string, stats: Stats) => Promise<DirectoryEntry>,
 ): Promise<DirectoryEntry[]> {
   const directoryEntries = await readdir(absolutePath, { withFileTypes: true, encoding: "buffer" });
   const entries: DirectoryEntry[] = [];
@@ -1291,7 +1428,7 @@ async function readDirectoryEntries(
     if (!directoryEntry.isFile()) continue;
     try {
       const fileStats = await stat(join(absolutePath, name));
-      if (fileStats.isFile()) entries.push(fileDescription(entryPath, join(absolutePath, name), fileStats));
+      if (fileStats.isFile()) entries.push(await describeFile(entryPath, join(absolutePath, name), fileStats));
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT") && !hasErrorCode(error, "ENOTDIR")) throw error;
     }
@@ -1312,7 +1449,8 @@ async function writeAtomically(
   mode: number | undefined,
   previousModified: number | undefined,
   temporaryPaths: Set<string>,
-): Promise<void> {
+  createOnly = false,
+): Promise<Stats> {
   let temporaryPath: string;
   let handle;
   while (true) {
@@ -1323,7 +1461,7 @@ async function writeAtomically(
       throw error;
     }
   }
-  let renamed = false;
+  let committed = false;
   let handleClosed = false;
   temporaryPaths.add(temporaryPath);
   try {
@@ -1334,13 +1472,89 @@ async function writeAtomically(
       const changedTime = new Date(previousModified + 1);
       await utimes(temporaryPath, changedTime, changedTime);
     }
-    await rename(temporaryPath, path);
-    renamed = true;
+    const writtenStats = await stat(temporaryPath);
+    if (createOnly) {
+      try { await link(temporaryPath, path); }
+      catch (error) {
+        if (hasErrorCode(error, "EEXIST")) throw new HttpError(412, "file already exists");
+        throw error;
+      }
+      committed = true;
+      await unlink(temporaryPath);
+    } else {
+      await rename(temporaryPath, path);
+      committed = true;
+    }
+    return writtenStats;
   } finally {
     if (!handleClosed) await handle.close().catch(() => undefined);
-    if (!renamed) await unlink(temporaryPath).catch(() => undefined);
+    if (!committed) await unlink(temporaryPath).catch(() => undefined);
     temporaryPaths.delete(temporaryPath);
   }
+}
+
+function validateParsers(options: Record<string, FileParser>): Map<string, FileParser> {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) throw new Error("parsers must be an object");
+  const parsers = new Map<string, FileParser>();
+  for (const [extension, parser] of Object.entries(options)) {
+    if (!/^\.[^./\\]+$/.test(extension)) throw new Error(`invalid parser extension: ${extension}`);
+    const key = extension.toLowerCase();
+    if (parsers.has(key)) throw new Error(`duplicate parser extension: ${extension}`);
+    if (parser === null || typeof parser !== "object" || typeof parser.parse !== "function"
+      || (parser.patch !== undefined && typeof parser.patch !== "function")) {
+      throw new Error(`invalid parser for ${extension}`);
+    }
+    parsers.set(key, parser);
+  }
+  return parsers;
+}
+
+async function parseFields(parser: FileParser, path: string, bytes: Uint8Array): Promise<Record<string, JsonValue>> {
+  try {
+    const fields: unknown = await parser.parse({ path, bytes });
+    if (!isParserJsonObject(fields) || !isParserJsonValue(fields)
+      || Object.keys(fields).some((key) => defaultFileKeys.has(key) || key === "parseError")) {
+      throw new Error("invalid parser description");
+    }
+    return structuredClone(fields) as Record<string, JsonValue>;
+  } catch {
+    return { parseError: "file could not be parsed" };
+  }
+}
+
+async function patchBytes(
+  parser: FileParser,
+  input: { path: string; bytes?: Uint8Array; changes: Record<string, JsonValue> },
+): Promise<Uint8Array> {
+  let bytes: unknown;
+  try { bytes = await (parser.patch as NonNullable<FileParser["patch"]>)(input); }
+  catch (error) { throw new HttpError(422, error instanceof Error ? error.message : String(error)); }
+  if (!(bytes instanceof Uint8Array)) throw new HttpError(500, "parser did not return bytes");
+  return bytes;
+}
+
+function matchesContentType(actual: string | undefined, expected: string): boolean {
+  if (actual === undefined) return false;
+  const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped}\\s*(?:;\\s*charset\\s*=\\s*utf-8\\s*)?$`, "i").test(actual);
+}
+
+function isParserJsonObject(value: unknown): value is Record<string, unknown> {
+  if (!isJsonObject(value)) return false;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isParserJsonValue(value: unknown, visited = new Set<object>()): value is JsonValue {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return false;
+  if (visited.has(value)) return false;
+  if (!Array.isArray(value) && !isParserJsonObject(value)) return false;
+  visited.add(value);
+  const valid = Object.values(value).every((entry) => isParserJsonValue(entry, visited));
+  visited.delete(value);
+  return valid;
 }
 
 function isEditContentType(contentType: string | undefined): boolean {
@@ -1508,13 +1722,14 @@ async function sendUpgradeError(socket: Duplex, status: number, message: string)
   });
 }
 
-function sendOptions(response: Response, request: Request): void {
+function sendOptions(response: Response, request: Request, methods: string, wantsJson: boolean): void {
   response.set({
-    "Access-Control-Allow-Methods": allowedMethods,
+    "Access-Control-Allow-Methods": methods,
     "Access-Control-Allow-Headers": allowedRequestHeaders,
     "Access-Control-Max-Age": "86400",
-    "Accept-Patch": editContentType,
   });
+  response.set("Allow", methods);
+  if (!wantsJson) response.set("Accept-Patch", editContentType);
   if (request.get("Access-Control-Request-Private-Network") === "true") {
     response.set("Access-Control-Allow-Private-Network", "true");
   }
@@ -1537,7 +1752,7 @@ function mapError(error: unknown): HttpError {
 
 function sendError(request: Request, response: Response, status: number, message: string): void {
   const body = Buffer.from(JSON.stringify({ error: message }));
-  if (status === 415) response.set("Accept-Patch", editContentType);
+  if (status === 415 && !hasJsonQuery(request.url)) response.set("Accept-Patch", editContentType);
   response.set({ "Content-Type": jsonContentType, "Content-Length": String(body.length) });
   response.status(status);
   if (request.method === "HEAD") response.end();

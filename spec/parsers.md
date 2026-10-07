@@ -55,8 +55,10 @@ writable `?json` address when its extension maps to a parser with `patch`.
 Then `Allow` is `GET, HEAD, PUT, PATCH, OPTIONS`, and responses carry
 `Accept-Patch: application/merge-patch+json`. Otherwise `Allow` is
 `GET, HEAD, OPTIONS`, `Accept-Patch` is absent, and `PUT` or `PATCH` with
-`?json` returns `405 Method Not Allowed`. After the path checks,
-`DELETE` with `?json` returns `405`; deletion uses the byte address.
+`?json` returns `405 Method Not Allowed`. Successful `?json` responses
+carry these headers too, not only `405` responses and preflights. After the
+path checks, `DELETE` with `?json` returns `405`; deletion uses the byte
+address.
 Symbolic links follow [Confinement](server.md#confinement).
 
 `OPTIONS` repeats the applicable `Allow` list in
@@ -72,9 +74,9 @@ and passes every other key, unchanged, as the `changes` object in
 `patch({ path, bytes, changes })`. `bytes` is the current file content;
 the parser applies the merge patch to its fields and rejects keys it
 cannot write. A missing path with a writable parser returns `404`. An empty
-patch returns `200`
-with the current single-file description, without a write or change
-signal. Otherwise the server writes the returned bytes once using the
+patch returns `200` with the current single-file description, without a
+write or change signal, even when the file cannot be parsed. Otherwise the
+server writes the returned bytes once using the
 [atomic write](server.md#writing), publishes the usual change signal, and
 returns `200` with the new single-file description.
 
@@ -94,8 +96,9 @@ response is `500 Internal Server Error` and the old file is left intact. A missi
 `Content-Type` is `415 Unsupported Media Type`; a malformed JSON body or
 a top-level value that is not an object is `400 Bad Request`. Media-type
 matching is case-insensitive and permits `charset=utf-8`. A request body
-larger than 16 MiB is `413 Content Too Large`; `PATCH` on a file larger
-than 16 MiB is `415`, and an output larger than 16 MiB is `413`. A failure
+larger than 16 MiB is `413 Content Too Large`. `PATCH` on a file larger
+than 16 MiB is `415`, checked before the request body is read. An output
+larger than 16 MiB is `413`, checked before the server parses it. A failure
 leaves the old file intact and publishes no signal. Successful structured
 write responses have `Content-Type: application/json; charset=utf-8`.
 
@@ -132,8 +135,8 @@ The wording of that string is not part of the contract. `frontmatterError`
 is absent when the frontmatter is valid. A `.md` file that is not valid
 UTF-8 cannot be parsed, so its description has `parseError` in place of
 `frontmatter` and `body`, as described under
-[Modules and selection](#modules-and-selection), and a `PATCH ?json` to it
-is `422`.
+[Modules and selection](#modules-and-selection), and a non-empty
+`PATCH ?json` to it is `422`.
 
 ### Markdown writes
 
