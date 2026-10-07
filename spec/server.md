@@ -9,8 +9,9 @@ mapping it adds.
 
 The resource is the request-target's undecoded path — or, when the
 exported app is mounted beneath a host's prefix, the path remaining after
-that prefix. For `GET` and `HEAD`, the presence of a case-sensitive `json`
-query parameter selects the JSON description; its value does not matter.
+that prefix. For `GET`, `HEAD`, `PUT`, `PATCH`, and `DELETE`, the presence of
+a case-sensitive `json` query parameter selects the structured address; its
+value does not matter.
 Other query parameters do not change the selected operation or
 representation. WebSocket upgrades ignore the query.
 Each segment is percent-decoded exactly once. A malformed escape, invalid
@@ -29,9 +30,9 @@ serves `index.html` and the other redirects to it (see
 [Directories](#directories)). `GET` or `HEAD` on `/file/` is `404`.
 Without `?json`, `PUT` or `PATCH` to `/` or to any slash-terminated path is
 `409 Conflict`. `DELETE` without `?json` accepts either spelling of a
-directory, except the root, which is `409`. Writes use the file address
-without `?json`; [Errors](#errors) specifies the base response to writes
-that carry `?json`.
+directory, except the root, which is `409`. Byte writes use the file
+address without `?json`; [Parsers](parsers.md#structured-writes) specifies
+the structured writes at `?json`.
 
 ## Routes
 
@@ -40,7 +41,9 @@ GET     /<path>        read file bytes or a directory index page
 GET     /<path>?json   describe an item or list a directory
 HEAD    /<path>        the corresponding GET status and headers, without a body
 PUT     /<path>        write a whole file
+PUT     /<path>?json   create or replace a file from structured JSON
 PATCH   /<path>        replace an anchored span within a text file
+PATCH   /<path>?json   change parsed fields in an existing file
 DELETE  /<path>        remove a file or directory
 OPTIONS /<path>        CORS preflight
 WS      /<dir>/        subscribe to root-wide change signals
@@ -69,13 +72,13 @@ process, the CLI's machine-readable `url:` announcement.
 
 There is no application-level size limit on a file.
 
-`GET /<path>?json` on a regular file returns its description as
-`application/json; charset=utf-8`, regardless of whether its format has a
-parser. The default object has exactly `path`, `kind`, `contentType`, `size`,
-and `modified`:
+On success, `GET /<path>?json` on a regular file returns its description
+as `application/json; charset=utf-8`. A file needs no parser for this
+description. The default object has exactly `path`, `kind`, `contentType`,
+`size`, and `modified`:
 
 ```json
-{ "path": "notes/todo.md", "kind": "file", "contentType": "text/markdown; charset=utf-8", "size": 812, "modified": "2026-07-24T10:02:11.000Z" }
+{ "path": "notes/todo.txt", "kind": "file", "contentType": "text/plain; charset=utf-8", "size": 812, "modified": "2026-07-24T10:02:11.000Z" }
 ```
 
 `path` is the full decoded path within the root, without a leading or
@@ -83,16 +86,18 @@ trailing slash, and is the address of the item relative to the root.
 `contentType` is exactly the `Content-Type` header on the byte response,
 including any charset; `size` is bytes; `modified` is
 `Date.toISOString()` for the modification time of the file. The default
-object has no `name`, `url`, or `created` key. A parser may add keys to this
-same object but may not replace or remove the default keys. None of the
-default keys is writable: `path`, `kind`, `contentType`, `size`, and
-`modified` all come from the file. A client must tolerate added keys.
+object has no `name`, `url`, or `created` key. None of the default keys is
+writable: `path`, `kind`, `contentType`, `size`, and `modified` all come from
+the file. [Parsers](parsers.md#modules-and-selection) defines additional
+fields, parser selection, and parse errors; a client must tolerate fields it
+does not know.
 
 JSON descriptions carry the exact serialised `Content-Length` but no `ETag`,
 `Last-Modified`, `Accept-Ranges`, or `Link` header. `If-None-Match`,
-`If-Modified-Since`, `If-Range`, and `Range` do not apply to them: a `?json`
-read returns the full `200` description, never a byte range or `304`. A
-byte response and a JSON description cannot share a validator.
+`If-Modified-Since`, `If-Range`, and `Range` do not apply to them: a
+successful `?json` read returns the full `200` description, never a byte
+range or `304`. A byte response and a JSON description cannot share a
+validator.
 
 **Ranges.** One `bytes` range is supported, in closed (`0-99`),
 open-ended (`100-`), or suffix (`-100`) form. A satisfiable range is
@@ -111,7 +116,7 @@ with weak comparison; when it is present, `If-Modified-Since` is ignored
 whether or not a tag matches. Otherwise `If-Modified-Since` applies. Both
 are evaluated before `Range`. A match is `304 Not Modified` with the
 validator and `Link` headers and no body. An unparseable date is ignored.
-Mutation precondition headers (`If-Match`, `If-Unmodified-Since`) are ignored.
+Mutation preconditions follow [Writing](#writing).
 
 `HEAD` on a file applies the conditionals for file bytes, ignores `Range`,
 and returns the status and headers of a full file `GET`, without a body.
@@ -147,7 +152,7 @@ without redirecting, as `application/json; charset=utf-8`. This includes
   "entries": [
     { "path": "notes/archive", "kind": "dir" },
     { "path": "notes/photos", "kind": "symlink" },
-    { "path": "notes/todo.md", "kind": "file", "contentType": "text/markdown; charset=utf-8", "size": 812, "modified": "2026-07-24T10:02:11.000Z" }
+    { "path": "notes/todo.txt", "kind": "file", "contentType": "text/plain; charset=utf-8", "size": 812, "modified": "2026-07-24T10:02:11.000Z" }
   ]
 }
 ```
@@ -156,10 +161,12 @@ without redirecting, as `application/json; charset=utf-8`. This includes
 root. Each entry has its full root-relative `path`. A directory entry is
 exactly `{ path, kind: "dir" }`; its own `?json` listing adds `entries`.
 A symbolic-link entry is `{ path, kind: "symlink" }` with nothing about its
-target. File and symbolic-link entries match their own `?json` descriptions.
-File entries have the fields and follow the parser rule in
-[Reading](#reading). `entries` is one level deep, sorted by the last path
-segment of each entry in the default JavaScript string order. Sockets,
+target. Symbolic-link entries match their own `?json` descriptions. A file
+entry is exactly its single-file `?json` description, including every
+[parser field](parsers.md#modules-and-selection).
+
+`entries` is one level deep, sorted by the last path segment of each entry
+in the default JavaScript string order. Sockets,
 devices, and other objects are omitted, as are entries whose names are not
 valid UTF-8 or contain `\` (they cannot be addressed) and temporary files
 from writes still in progress (see
@@ -173,8 +180,7 @@ goes.
 
 Extensions may add kinds. A client must tolerate an unrecognised `kind` by
 treating the entry as opaque rather than rejecting the listing; its `path`
-remains addressable by the rule above. Added fields on a file entry also
-appear in its `?json` description.
+remains addressable by the rule above.
 
 `Range` and the conditional headers do not apply to directory listings,
 which have the JSON headers stated under [Reading](#reading).
@@ -184,13 +190,19 @@ rule and does not redirect.
 
 ## Writing
 
-`PUT /<path>` writes the request body as the whole file, creating missing
-parent directories. Any bytes are accepted; `Content-Type` may be absent;
-a zero-length body creates or replaces an empty file. There is no
-application-level size limit. It returns
+`PUT /<path>` without `?json` writes the request body as the whole file,
+creating missing parent directories. Any bytes are accepted;
+`Content-Type` may be absent; a zero-length body creates or replaces an
+empty file. There is no application-level size limit. It returns
 `201 Created` for a new file and `204 No Content` for an overwrite. A
 `PUT` whose path is an existing directory is `409 Conflict`; a directory
 is not replaced with a file.
+
+`If-None-Match: *` makes every `PUT` create only, whether it sends bytes
+or uses `?json`. After path and resource checks, an existing file returns
+`412 Precondition Failed` before body validation, and nothing is written.
+The condition is checked again at commit, so two competing creations cannot
+replace each other. Other mutation precondition values are ignored.
 
 The write is atomic to readers: a concurrent `GET` sees the old content or
 the new, never a mixture, and a transfer that fails leaves the existing
@@ -208,8 +220,8 @@ resource.
 
 ## Editing
 
-`PATCH /<path>` replaces an anchored span of a text file without resending
-it. The body is JSON sent as
+`PATCH /<path>` without `?json` replaces an anchored span of a text file
+without resending it. The body is JSON sent as
 `Content-Type: application/vnd.telepath.edit+json` (matched
 case-insensitively; an optional `charset=utf-8` parameter is permitted):
 
@@ -243,7 +255,7 @@ Content` (it anchors nothing); one not found is `422`; one that is
 ambiguous (more than one match, `replace_all` false) is `409`; a result
 that would exceed 16 MiB once re-encoded is `413` and nothing is written.
 Success is `204 No Content`, written atomically as for `PUT`. Every `415`
-and every `OPTIONS` response carries
+and every `OPTIONS` response on a byte address carries
 `Accept-Patch: application/vnd.telepath.edit+json`.
 
 This is the anchored, must-be-unique contract a coding agent's edit tool
@@ -252,8 +264,8 @@ uses, so its failure modes are ones an agent already understands. It is a
 carries no idempotency requirement — an edit that fails to re-match on a
 second application fits it. `PATCH` dispatches on the body's media type,
 so other patch documents can be added beside this one without changing it.
-A parser extension may use the existing [extension hook](#extension-seam) to
-accept `PATCH ?json` for writable keys it adds, such as Markdown frontmatter.
+[Structured patches](parsers.md#structured-writes) use `?json` and a
+different media type.
 
 ## Confinement
 
@@ -296,11 +308,11 @@ restriction on this one.
 
 ## Concurrency
 
-Mutations are not serialised and accept no preconditions. Concurrent
-writes to one path are last-write-wins — the write whose atomic commit
-completes last determines the final state, not the request received last —
-each atomic on its own; a `PATCH` can lose a change made between its read
-and its write.
+Mutations are not serialised. Except for a `PUT` using the
+[create-only condition](#writing), concurrent file writes to one path are
+last-write-wins: the write whose atomic commit finishes last determines
+the final file, regardless of request order. A `PATCH` can lose a change
+made between its read and its write.
 
 ## Change stream
 
@@ -347,7 +359,7 @@ WebSockets are exempt from CORS.
 
 The [HTTP rules](index.md#http-conventions) apply.
 [Errors](#errors) specifies when a preflight is accepted. An accepted
-preflight has these header values:
+preflight for a byte address has these header values:
 
 ```
 Access-Control-Allow-Methods: GET, HEAD, PUT, PATCH, DELETE, OPTIONS
@@ -357,23 +369,30 @@ Access-Control-Max-Age: 86400
 Accept-Patch: application/vnd.telepath.edit+json
 ```
 
+On a `?json` address, the [parser method rules](parsers.md#structured-writes)
+set `Allow`, `Access-Control-Allow-Methods`, and `Accept-Patch`; the other
+preflight headers above stay the same.
+
 Non-`OPTIONS` responses carry `Access-Control-Expose-Headers` too, so
 a page can read the validators, range headers, and file-description link.
 
 ## Errors
 
-A method outside the set above is `405 Method Not Allowed` with
-`Allow: GET, HEAD, PUT, PATCH, DELETE, OPTIONS`, whether or not the path
-exists, subject to the path checks below. Checks are applied in the order:
+A method outside the set above is `405 Method Not Allowed`, whether or not
+the path exists, subject to the path checks below. Its byte-address response
+has `Allow: GET, HEAD, PUT, PATCH, DELETE, OPTIONS`; a `?json` response uses
+the [parser method list](parsers.md#structured-writes). Checks are applied
+in the order:
 URL syntax (`400`); hidden segments (`404`); symbolic links (`403`) and
 special objects (`404`), except for the exact-link `GET` or `HEAD`
 description; unsupported method (`405`) or `OPTIONS` (`204` regardless of
-existence); confinement; the extension `handle` hook; `PUT`, `PATCH`, or
-`DELETE` with `?json` not handled by an extension (`405` with
-`Allow: GET, HEAD, OPTIONS`); resource type (`404`, `409`); then the
-operation's own validation. A missing path requested with `?json` is
-`404` with the standard error body; an unknown file format still has a
-default JSON description. Filesystem failures map `ENOENT`/`ENOTDIR` to
+existence); confinement; [parser method eligibility](parsers.md#structured-writes)
+for `PUT`, `PATCH`, or `DELETE` with `?json` (`405`); the extension
+`handle` hook; resource type (`404`, `409`); then the operation's own
+validation. A missing path read with `?json` is `404`; a missing path
+patched at a writable `?json` address is also `404`. Structured `PUT` can
+create one. An unknown file format still has a default JSON description.
+Filesystem failures map `ENOENT`/`ENOTDIR` to
 `404`, `EACCES`/`EPERM` to `403`, and anything unexpected to `500`.
 
 Every error response except to `HEAD` has a body: `application/json;
@@ -384,8 +403,9 @@ no body; `204` and `304` responses have no body.
 
 ## API
 
-The package exports the server and its extension types, so a host can run or
-extend the protocol in its own process instead of spawning the binary.
+The package exports `FileServer`, `FileParser`, and the extension types,
+so a host can run or extend the protocol in its own process instead of
+spawning the binary.
 
 ```js
 import { FileServer } from "@rupertsworld/fileserver";
@@ -400,16 +420,19 @@ console.log(server.url);
 server rather than the resolved value, so it is available wherever the
 instance is held.
 
-- `new FileServer({ root, defaultPort?, pingIntervalMs?, ignore?, extension? })` —
+- `new FileServer({ root, defaultPort?, pingIntervalMs?, ignore?, parsers?, extension? })` —
   `root` is the directory to serve, resolved through symbolic links; it must
   exist and be a directory. `ignore` is an array of
   [ignore patterns](cli.md#config) and defaults to none. `defaultPort` sets
   the base port used when `listen` receives no explicit port and defaults
   to `8765`. `pingIntervalMs` controls WebSocket keepalive and defaults to
-  30 seconds. `extension` is the protocol-extension seam below.
+  30 seconds. `parsers` supplies the
+  [map from extension to parser](parsers.md#modules-and-selection).
+  `extension` is the protocol-extension seam below.
 - `ready` — resolves once the root has been resolved and checked and the
-  change watcher is ready; it rejects if either fails. `listen` awaits it,
-  and so does every request handled through `app`, so a host that mounts
+  change watcher is ready and the parser set has passed validation; it
+  rejects if any fails. `listen` awaits it, and so does every request
+  handled through `app`, so a host that mounts
   `app` without calling `listen` gets the same readiness check.
 - `listen({ host?, port? })` — `host` defaults to `127.0.0.1`. With no
   `port`, it binds from the configured `defaultPort` according to the
@@ -457,10 +480,10 @@ instance is held.
 
 ### Extension seam
 
-The package exports `FileServerExtension`, `FileServerExtensionContext`,
-`DirectoryListing`, `DirectoryEntry`, and `FileChangeEvent` beside
-`FileServer`. An extension does not replace or copy the base router. It
-handles only the deltas its own wire spec names and
+The package exports `FileServerExtension`,
+`FileServerExtensionContext`, `DirectoryListing`, `DirectoryEntry`, and
+`FileChangeEvent` beside `FileServer`. An extension does not replace or copy
+the base router. It handles only the deltas its own wire spec names and
 must delegate every other request and representation unchanged.
 
 The exported wire shapes have the meanings established above:
@@ -469,13 +492,14 @@ The exported wire shapes have the meanings established above:
   decoded root-relative string without leading or trailing slash, empty for
   the root, and `entries` is an array of `DirectoryEntry` values.
 - `DirectoryEntry` has a decoded full root-relative `path` string and a
-  `kind` string. For core values it is exactly `{ path, kind: "dir" }`,
-  `{ path, kind: "symlink" }`, or `{ path, kind: "file", contentType, size,
+  `kind` string. Before parser or extension keys, core values are
+  `{ path, kind: "dir" }`, `{ path, kind: "symlink" }`, or
+  `{ path, kind: "file", contentType, size,
   modified }`. `contentType` is the full `Content-Type` of the response
   serving file bytes, `size` is a byte count, and `modified` is an ISO 8601
   string. The type permits other kinds and JSON-compatible properties.
-  Fields added to file entries follow [Reading](#reading). A directory
-  `?json` listing has `entries` in addition to its directory entry fields,
+  File entries carry [parser fields](parsers.md#modules-and-selection). A
+  directory `?json` listing has `entries` in addition to its entry fields,
   as specified under [Directories](#directories).
 - `FileChangeEvent` is an object with `type` equal to `created`, `modified`,
   or `deleted`, and a decoded root-relative `path` string, exactly as in
@@ -486,8 +510,10 @@ Each hook may return its result directly or return a promise for it; the
 server awaits either form:
 
 - `handle(request, response, context): boolean | Promise<boolean>` runs after
-  URL hygiene, confinement, common headers, method validation, and `OPTIONS`,
-  but before base resource dispatch. `request` and `response` are the Express
+  URL hygiene, confinement, common headers, method validation, `OPTIONS`,
+  and parser method eligibility, but before base parser and resource
+  dispatch. Structured `?json` mutations belong to parser modules, so
+  `handle` delegates them. `request` and `response` are the Express
   request and response. It returns a boolean: `true` only after ending the
   response, or `false` without having changed the response to delegate to the
   base handler. Returning
@@ -497,9 +523,10 @@ server awaits either form:
   closed.
 - `listing(request, listing, context): DirectoryListing |
   Promise<DirectoryListing>` receives the base one-level `DirectoryListing`
-  immediately before serialization. `request` is the Express request, and
+  immediately before serialisation, after parser fields have been added to
+  file entries. `request` is the Express request, and
   `context` identifies the directory being listed. The hook returns the
-  `DirectoryListing` to serialize. This is where an extension decorates
+  `DirectoryListing` to serialise. This is where an extension decorates
   entries or selects a named alternate listing representation. The returned
   listing follows the [entry rules](#directories), including the relation
   between entries and item descriptions. A return value that is not a valid
