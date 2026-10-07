@@ -9,9 +9,12 @@ writes, and the built-in Markdown parser.
 
 A parser module exports `parse({ path, bytes })` and may export
 `patch({ path, bytes, changes })`. Each function takes one object and may
-return a promise. `path` is the decoded root-relative file path, and
-`bytes` is a `Uint8Array`. `parse` returns a JSON object. `patch` returns
-the new file bytes as a `Uint8Array`; without it, the parser is read-only.
+return a promise. `path` is the decoded root-relative file path. `parse`
+receives the file content as `bytes`, a `Uint8Array`, and returns a JSON
+object. `patch` receives `bytes` only when it changes an existing file
+(`PATCH ?json`); for `PUT ?json` it receives no `bytes` and builds the whole
+file from `changes`. It returns the new file bytes as a `Uint8Array`;
+without `patch`, the parser is read-only.
 Parsers do not read or write the filesystem.
 
 If `parse` throws, or returns something other than a JSON object, or an
@@ -77,7 +80,7 @@ returns `200` with the new single-file description.
 
 `PUT <path>?json` takes `Content-Type: application/json` and a top-level
 JSON object. The server removes the default keys and passes all remaining
-keys as `changes` to `patch({ path, bytes, changes })`, with empty `bytes`.
+keys as `changes` to `patch({ path, changes })`, without `bytes`.
 The parser constructs the whole new file. Missing parent directories are
 created. The server writes once using the same atomic write, publishes the
 usual signal, and returns the new single-file description with `201
