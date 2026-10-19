@@ -111,5 +111,14 @@ and `chokidar` for filesystem changes.
   publish directly when their atomic change completes and suppress the
   duplicate watcher signal, so they do not wait for the debounce. Initial
   indexing does not publish events or incur the debounce delay.
+- **Git refs** are read with the git plumbing commands: `rev-parse` resolves
+  the ref, `cat-file` reads the commit date and file contents, and `ls-tree`
+  resolves paths and lists directories. Git runs with the inherited `GIT_*`
+  environment variables removed, pathspecs read literally, and lazy fetching
+  of missing objects, replacement objects, optional locks, and terminal
+  prompts turned off. The git directory named by a `.git` file, and the common
+  directory of a linked worktree, are resolved with `realpath` and checked to
+  lie beneath the root before git runs. Nothing read at a ref is cached
+  between requests.
 - **CLI** is a thin wrapper over the exported server: parse flags, read
   the config, construct, `listen`, print, and close on signals.

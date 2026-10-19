@@ -45,6 +45,17 @@ The tests cover:
   write or signal, atomic failure, and change signals; `If-None-Match: *`
   preventing either form of `PUT` from overwriting an existing file,
   including during competing creations.
+- Git refs, against temporary repositories that include a linked worktree,
+  a nested repository, and a submodule entry: file bytes, `HEAD`, ranges,
+  the strong `ETag` and `304`, `If-Range`, `Cache-Control` for a full commit
+  ID and its absence for a branch, the `Link` header, `?json` descriptions
+  with parser fields and the commit date, listings with every entry kind,
+  `index.html` and redirects, files absent from the disk, hidden and ignored
+  paths, symbolic links, unknown refs, paths outside a repository, a
+  worktree whose git directory is outside the root, bytes read without
+  checkout filters, a ref that looks like an option, `400` for malformed
+  `ref` values, `405` for mutations with nothing changed, preflight, `500`
+  when git cannot run, and a WebSocket subscription unaffected by `ref`.
 - Through the built binary: startup output and the `url:` line, flag errors,
   `--help`/`--version`, the config file and `--ignore`, clean shutdown on
   `SIGTERM`, one round trip per method, and one WebSocket refetch cycle.
@@ -53,9 +64,10 @@ Consumer-skill tests check that an agent or artifact creating a file is
 told to send `If-None-Match: *` and that the skill explains Markdown
 descriptions, structured writes, and whole-file `PUT` for byte changes.
 
-Four properties are stated as invariants and covered by targeted tests and
+Five properties are stated as invariants and covered by targeted tests and
 review rather than proven black-box: a reader never observes a partially
 written file; `GET` responses serving file bytes and byte `PUT` bodies are
 streamed; the server never watches an ignored path, which a test checks by
-reading the paths the watcher holds; and confinement, whose stated limit is
-a race no test can close.
+reading the paths the watcher holds; confinement, whose stated limit is
+a race no test can close; and the 10-second limit on git commands, which a
+test would have to wait out.

@@ -11,9 +11,11 @@ The resource is the request-target's undecoded path — or, when the
 exported app is mounted beneath a host's prefix, the path remaining after
 that prefix. For `GET`, `HEAD`, `PUT`, `PATCH`, and `DELETE`, the presence of
 a case-sensitive `json` query parameter selects the structured address; its
-value does not matter.
+value does not matter. For the same methods, a case-sensitive `ref` query
+parameter selects the content at a git ref, as specified under
+[Git refs](#git-refs); its value is the ref.
 Other query parameters do not change the selected operation or
-representation. WebSocket upgrades ignore the query.
+representation. WebSocket upgrades ignore the query, including `ref`.
 Each segment is percent-decoded exactly once. A malformed escape, invalid
 UTF-8, a null byte, a backslash (raw or encoded), an encoded `/`, or an
 empty interior segment (`/a//b`) is `400 Bad Request`. A decoded segment
@@ -37,15 +39,17 @@ the structured writes at `?json`.
 ## Routes
 
 ```
-GET     /<path>        read file bytes or a directory index page
-GET     /<path>?json   describe an item or list a directory
-HEAD    /<path>        the corresponding GET status and headers, without a body
-PUT     /<path>        write a whole file
-PUT     /<path>?json   create or replace a file from structured JSON
-PATCH   /<path>?json   change parsed fields in an existing file
-DELETE  /<path>        remove a file or directory
-OPTIONS /<path>        CORS preflight
-WS      /<dir>/        subscribe to root-wide change signals
+GET     /<path>                 read file bytes or a directory index page
+GET     /<path>?json            describe an item or list a directory
+GET     /<path>?ref=<ref>       read file bytes or a directory index page at a git ref
+GET     /<path>?json&ref=<ref>  describe an item or list a directory at a git ref
+HEAD    /<path>                 the corresponding GET status and headers, without a body
+PUT     /<path>                 write a whole file
+PUT     /<path>?json            create or replace a file from structured JSON
+PATCH   /<path>?json            change parsed fields in an existing file
+DELETE  /<path>                 remove a file or directory
+OPTIONS /<path>                 CORS preflight
+WS      /<dir>/                 subscribe to root-wide change signals
 ```
 
 Every syntactically valid path recognises this method set and no other;
@@ -187,6 +191,127 @@ which have the JSON headers stated under [Reading](#reading).
 without a body. `OPTIONS` on a directory follows the ordinary preflight
 rule and does not redirect.
 
+## Git refs
+
+`GET` and `HEAD` with `?ref=<ref>` read the served tree as it is at a git
+ref instead of as it is on disk: the bytes of a file, the `index.html` of a
+directory, or, with `?json` as well, a file description or directory listing. Requests
+with `ref` never change anything. Requests without `ref` and the change
+stream are unaffected by them.
+
+The value of `ref` is decoded as `application/x-www-form-urlencoded`, so a
+`+` in a ref name is sent as `%2B`. It may be anything git resolves to a
+commit: a branch, a tag, a full or abbreviated commit ID, `HEAD`, or an
+expression such as `main~2`. An empty value, a value containing a null
+character, or more than one `ref` parameter is `400 Bad Request`.
+
+**Repository.** The repository is the nearest one enclosing the requested
+path: the deepest directory, among the root, the ancestors of the path, and
+the path itself, that contains a `.git` directory or a `.git` file (as a linked
+worktree or a submodule checkout has). The search walks the path on disk only
+while each component exists as a directory, and never follows a symbolic
+link, so the rest of the path need exist only at the ref. The requested path
+is then resolved, relative to that directory, in the tree of the commit the
+ref names. A path with no enclosing repository is `404 Not Found`, as is one
+whose repository keeps its git directory outside the root; for a linked
+worktree this includes the git directory of the main repository, which the
+worktree shares. A repository above the root is never used. Because the
+search looks at the disk, a path inside a submodule that is checked out is
+read from the repository of the submodule itself.
+
+The ref is resolved in that repository. Branches and tags are shared by every
+worktree of a repository; `HEAD` is the commit checked out in the worktree
+that encloses the path. A ref that git cannot resolve to a commit is `404`.
+
+**Paths at a ref.** The tree at the ref is read with the visibility rules of
+the disk: dot-prefixed names are hidden, and ignore patterns apply to the
+full root-relative path, with a pattern ending in `/` matching a path that is
+a directory at the ref. A hidden or absent path is `404`. Symbolic links at
+the ref follow [Confinement](#confinement): `GET` or `HEAD` with `?json` on
+the exact path of a link, without a trailing slash, returns
+`{ path, kind: "symlink" }`, and every other request to the link or through
+it is `403 Forbidden`. A submodule, which a tree records as a commit, is an
+opaque entry: `GET` or `HEAD` with `?json` on its exact path returns
+`{ path, kind: "submodule" }`, and every other request to it or beneath it is
+`404`.
+
+**Files.** A file at a ref is a regular file in its tree. `GET` returns the
+bytes of the file as git stores them, without checkout filters such as
+line-ending conversion or Git LFS. The response has the headers of
+[Reading](#reading), with these differences:
+
+- `ETag` is the strong tag `"<blob ID>"`, the git object ID of the file
+  content.
+- There is no `Last-Modified`, because git records no modification time for
+  a file. `If-Modified-Since` is ignored. `If-Range` permits `206` only when
+  it is an entity tag equal to the `ETag`; a date or any other value returns
+  the full `200`.
+- `Link` is `<name?json&ref=<ref>>; rel="describedby"`, with the ref
+  percent-encoded, so it names the description at the same ref.
+- When the `ref` value is exactly the full commit ID it resolves to,
+  `200`, `206`, and `304` responses carry
+  `Cache-Control: max-age=31536000, immutable`: the content of a commit
+  cannot change. Any other ref can move to another commit, so its responses
+  carry no `Cache-Control` and a client revalidates with the `ETag`.
+
+Ranges, `If-None-Match`, `304`, and `HEAD` otherwise follow
+[Reading](#reading).
+
+The `?json` description of a file at a ref has the default keys and parser
+fields of [Reading](#reading), computed from the file at the ref: parsers
+receive its bytes, `size` is its size, and `modified` is the committer date
+of the commit the ref resolves to. JSON descriptions at a ref have the JSON
+headers of [Reading](#reading) and no validators or `Cache-Control`.
+
+**Directories.** [Directories](#directories) applies with the tree at the ref
+in place of the disk. `GET /<dir>/?ref=<ref>` serves the regular
+`index.html` at the ref, with `Link: <index.html?json&ref=<ref>>`, or returns
+the `404` that asks for `?json`; `GET /<dir>?ref=<ref>` redirects to the
+slash-terminated URL with the query kept. With `?json`, both spellings return
+`{ path, kind: "dir", entries }` as at the ref. Entries are file descriptions
+as above, `{ path, kind: "dir" }`, `{ path, kind: "symlink" }`, or
+`{ path, kind: "submodule" }`. Each matches its own `?json` description at
+the ref, except a `submodule` entry for a submodule that is checked out,
+whose path is read from the repository of the submodule itself. Hidden
+entries, names that are not valid UTF-8 or contain `\`, and the sort order
+follow [Directories](#directories). A client that does not recognise
+`submodule` treats the entry as opaque, as for any unrecognised `kind`.
+
+**Read-only.** Every address with `ref` is read-only. Its `Allow` is
+`GET, HEAD, OPTIONS` whatever the parser, and responses carry no
+`Accept-Patch`. As at other addresses, `?json` responses always carry
+`Allow`, and byte responses carry it only with `405` and preflights. `PUT`,
+`PATCH`, and `DELETE` with `ref` are `405 Method Not Allowed` and change
+nothing. An accepted `OPTIONS` preflight is `204` regardless of existence,
+with `Access-Control-Allow-Methods: GET, HEAD, OPTIONS`.
+
+Checks with `ref` are applied in this order: URL syntax, including the `ref`
+value (`400`); hidden segments and ignore patterns that hide the path
+whatever its type (`404`); unsupported methods, `PUT`, `PATCH`, and `DELETE`
+(`405`) or `OPTIONS` (`204`); the repository (`404`); the ref (`404`); then
+the path at the ref: ignore patterns that depend on its type (`404`),
+symbolic links (`403`), absence (`404`), and the resource type rules above.
+The checks made on disk for symbolic links (`403`) and special objects
+(`404`) do not apply to a path read at a ref, except that the repository
+search stops at them. Requests with `ref` do not reach the
+extension hooks (see [Extension seam](#extension-seam)).
+
+**Git.** The server runs the `git` on its `PATH`, and needs one only for
+requests with `ref`. It runs git without a shell and resolves the ref with
+`git rev-parse --verify --end-of-options <ref>^{commit}`; every other
+argument that comes from the request follows `--end-of-options` or `--`, so
+a request can never supply a git option. It does not fetch, write, or lock
+anything in the repository. A git command whose output the server waits for
+before responding is stopped after 10 seconds, and the request is then
+`500 Internal Server Error`, as is a failure to run git or any other git
+failure. Streaming the bytes of a file has no time limit and stops when the
+client disconnects.
+
+**Changes.** The change stream reports nothing about refs. `.git` is
+hidden, so a commit, a branch update, or a checkout signals only the
+working-tree paths it changes, and a client reading at a branch learns that
+the branch has moved only by fetching again.
+
 ## Writing
 
 `PUT /<path>` without `?json` writes the request body as the whole file,
@@ -322,7 +447,8 @@ Byte-address responses do not carry `Accept-Patch`.
 
 On a `?json` address, the [parser method rules](parsers.md#structured-writes)
 set `Allow`, `Access-Control-Allow-Methods`, and `Accept-Patch`; the other
-preflight headers above stay the same.
+preflight headers above stay the same. On an address with `ref`, the
+[read-only rule](#git-refs) sets them.
 
 Non-`OPTIONS` responses carry `Access-Control-Expose-Headers` too, so
 a page can read the validators, range headers, and file-description link.
@@ -347,6 +473,7 @@ patched at a writable `?json` address is also `404`. Structured `PUT` can
 create one. An unknown file format still has a default JSON description.
 Filesystem failures map `ENOENT`/`ENOTDIR` to
 `404`, `EACCES`/`EPERM` to `403`, and anything unexpected to `500`.
+[Git refs](#git-refs) gives the order of checks for a request with `ref`.
 
 Every error response except to `HEAD` has a body: `application/json;
 charset=utf-8` in the [error shape](index.md#http-conventions), so
@@ -457,6 +584,9 @@ The exported wire shapes have the meanings established above:
 - `FileChangeEvent` is an object with `type` equal to `created`, `modified`,
   or `deleted`, and a decoded root-relative `path` string, exactly as in
   [Change stream](#change-stream). It has no other properties.
+
+A request with `ref` is served by the base alone and reaches neither
+`handle` nor `listing`; the hooks see only the tree on disk.
 
 `FileServerExtension` is an object with any of these three optional hooks.
 Each hook may return its result directly or return a promise for it; the

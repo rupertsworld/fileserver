@@ -69,6 +69,17 @@ The skill covers:
   unwritable key with `422`. For Markdown, `frontmatter` merges and `body`
   replaces the text after it; [Markdown writes](parsers.md#markdown-writes)
   specifies how frontmatter formatting is kept.
+- **Reading at a git ref.** Adding `ref=<ref>` to a `GET` or `HEAD`, with
+  or without `json`, reads a file, `index.html`, description, or listing as
+  it is at that branch, tag, or commit in the nearest enclosing git
+  repository or worktree, and is otherwise shaped like the live read. The
+  skill covers encoding the ref as a query value; that requests with `ref`
+  are read-only (`405` for `PUT`, `PATCH`, and `DELETE`); the `404`s for an
+  unknown ref, a path outside any repository, and a path absent at the ref;
+  the strong `ETag` and absent `Last-Modified`; `Cache-Control: immutable`
+  only for a full commit ID; `modified` as the date of the commit; the
+  `submodule` kind; and that the change stream says nothing about refs, so a
+  view of a branch refetches to see it move.
 - **Live updates.** Subscribe by WebSocket to `/`, mapping the scheme from
   the base URL. A message is only `{ type, path }`, where `type` is
   `created`, `modified`, or `deleted`; treat it as "refetch", never as a
@@ -76,8 +87,8 @@ The skill covers:
   history or replay; do not overlap refreshes; reconnect with backoff. A
   client may filter by path prefix only when its whole view depends on that
   subtree.
-- **Boundaries.** No authentication; only the `json` query parameter has a
-  meaning, and other parameters are ignored. The skill covers the
+- **Boundaries.** No authentication; only the `json` and `ref` query
+  parameters have a meaning, and other parameters are ignored. The skill covers the
   [method restrictions](server.md#errors) on `DELETE ?json` and byte
   `PATCH`; deletions and whole-file changes use the byte address.
   Dot-prefixed paths, paths matching configured
