@@ -107,6 +107,17 @@ checks. Structured request bodies and results are limited to 16 MiB.
 `OPTIONS` provides the CORS preflight response. See [`spec/`](spec/index.md) for the
 complete wire contract, CLI, and API.
 
+Add `?ref=<ref>` to a `GET` or `HEAD` to read a file, listing, or description
+as it is at a git branch, tag, or commit in the nearest git repository or
+worktree enclosing the path. Reads at a ref are read-only, use the git ID of
+the file content as a strong `ETag`, and are marked immutable when `ref` is a
+full commit ID. The server needs `git` on its `PATH` only for these requests.
+
+```sh
+curl 'http://127.0.0.1:8765/code/app/README.md?ref=main'
+curl 'http://127.0.0.1:8765/code/app/src/?json&ref=v1.0'
+```
+
 Open a WebSocket at `/`, or at the slash-terminated URL of any existing
 directory, to receive `{ "type", "path" }` change signals for the whole served
 root. Each signal means that dependent state must be fetched again; the stream

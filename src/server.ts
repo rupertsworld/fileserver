@@ -11,6 +11,21 @@ import express, { type Request, type Response } from "express";
 import mimeTypes from "mime-types";
 import { WebSocket, WebSocketServer } from "ws";
 
+import {
+  findRepository,
+  GitError,
+  listTree,
+  PathThroughLink,
+  readBlob,
+  readBlobs,
+  resolveCommit,
+  resolvePath,
+  streamBlob,
+  type GitCommit,
+  type GitRepository,
+  type GitResource,
+  type GitTreeEntry,
+} from "./git.ts";
 import { IgnorePatterns } from "./ignore.ts";
 import * as markdown from "./parsers/markdown.ts";
 
@@ -22,12 +37,14 @@ const mergePatchContentType = "application/merge-patch+json";
 const jsonContentType = "application/json; charset=utf-8";
 const maximumStructuredBytes = 16_777_216;
 const defaultFileKeys = new Set(["path", "kind", "contentType", "size", "modified"]);
-const readOnlyJsonMethods = "GET, HEAD, OPTIONS";
+const readOnlyMethods = "GET, HEAD, OPTIONS";
 const writableJsonMethods = "GET, HEAD, PUT, PATCH, OPTIONS";
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const watcherDebounceMs = 50;
 const watcherSuppressionMs = 1_000;
 const defaultPortRangeWidth = 100;
+const refMethods = new Set(["GET", "HEAD", "OPTIONS"]);
+const immutableCacheControl = "max-age=31536000, immutable";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -89,6 +106,15 @@ type InspectedPath = {
   deepestExistingPath: string;
   missing: boolean;
   stats?: Stats;
+};
+type FileMetadata = { contentType: string; etag: string; lastModified?: string; link: string; cacheControl?: string };
+/** A request with `ref`, resolved as far as its repository and commit. */
+type RefRequest = {
+  parsed: ParsedPath;
+  ref: string;
+  wantsJson: boolean;
+  repository: GitRepository;
+  commit: GitCommit;
 };
 type ByteRange = { kind: "range"; start: number; end: number } | { kind: "unsatisfiable" } | { kind: "full" };
 type PendingWatcherEvent = { event: FileChangeEvent; timer: ReturnType<typeof setTimeout> };
@@ -314,8 +340,11 @@ export class FileServer {
   }
 
   private async handleRequest(request: Request, response: Response): Promise<void> {
+    const ref = parseRefQuery(request.url);
+    if (ref instanceof HttpError) { sendError(request, response, ref.status, ref.message); return; }
     const parsed = parseRequestPath(request.url);
     if (parsed instanceof HttpError) { sendError(request, response, parsed.status, parsed.message); return; }
+    if (ref !== undefined) { await this.handleRefRequest(request, response, parsed, ref); return; }
     if (await this.isIgnoredPath(parsed)) { sendError(request, response, 404, "not found"); return; }
     const root = this.resolvedRoot as string;
     const inspected = await inspectPath(root, parsed.segments);
@@ -324,7 +353,7 @@ export class FileServer {
     const writableJson = wantsJson && !parsed.trailingSlash
       && (inspected.missing || inspected.stats?.isFile() === true)
       && parser?.patch !== undefined;
-    const methods = wantsJson ? (writableJson ? writableJsonMethods : readOnlyJsonMethods) : byteAllowedMethods;
+    const methods = wantsJson ? (writableJson ? writableJsonMethods : readOnlyMethods) : byteAllowedMethods;
 
     // An exact link has one safe representation. All other requests must be
     // refused before method dispatch, including OPTIONS and unknown methods.
@@ -391,17 +420,142 @@ export class FileServer {
         sendJsonDescription(request, response, listing);
         return;
       }
-      if (!parsed.trailingSlash) {
-        const name = parsed.segments.at(-1) as string;
-        const query = request.url.includes("?") ? request.url.slice(request.url.indexOf("?")) : "";
-        response.set("Location", `${encodeURIComponent(name)}/${query}`);
-        response.status(307).end();
-        return;
-      }
+      if (!parsed.trailingSlash) { redirectToDirectory(request, response, parsed); return; }
       await this.sendDirectoryIndex(request, response, parsed);
       return;
     }
     sendError(request, response, 404, "not found");
+  }
+
+  /**
+   * Serves a request with `ref` from the tree at that ref (spec/server.md#git-refs).
+   * The disk is consulted only to find the repository; extension hooks are
+   * not run.
+   */
+  private async handleRefRequest(request: Request, response: Response, parsed: ParsedPath, ref: string): Promise<void> {
+    const { asFile, asDirectory } = this.ignorePatterns.hidesRequested(parsed.path);
+    if (asFile && asDirectory) { sendError(request, response, 404, "not found"); return; }
+    const wantsJson = hasJsonQuery(request.url);
+    if (wantsJson) response.set("Allow", readOnlyMethods);
+    if (!refMethods.has(request.method)) {
+      response.set("Allow", readOnlyMethods);
+      sendError(request, response, 405, "method not allowed");
+      return;
+    }
+    if (request.method === "OPTIONS") { sendOptions(response, request, readOnlyMethods); return; }
+
+    try {
+      const root = this.resolvedRoot as string;
+      const repository = await findRepository(root, parsed.segments);
+      if (repository === undefined) { sendError(request, response, 404, "not in a git repository"); return; }
+      const commit = await resolveCommit(repository.gitDir, ref);
+      if (commit === undefined) { sendError(request, response, 404, "unknown ref"); return; }
+      const context: RefRequest = { parsed, ref, wantsJson, repository, commit };
+
+      let resource: GitResource | undefined;
+      let failure: unknown;
+      try { resource = await resolvePath(repository.gitDir, commit, parsed.segments.slice(repository.depth)); }
+      catch (error) { failure = error; }
+      if (asFile !== asDirectory) {
+        const isDirectory = resource?.type === "dir" || resource?.type === "submodule";
+        if (isDirectory ? asDirectory : asFile) { sendError(request, response, 404, "not found"); return; }
+      }
+      if (failure instanceof PathThroughLink) { sendError(request, response, 403, "forbidden"); return; }
+      if (failure !== undefined) throw failure;
+      await this.sendRefResource(request, response, context, resource as GitResource);
+    } catch (error) {
+      if (error instanceof GitError) {
+        console.error("fileserver git error", error.detail ?? error.message);
+        if (response.headersSent) { response.destroy(); return; }
+        sendError(request, response, 500, error.message);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async sendRefResource(request: Request, response: Response, context: RefRequest, resource: GitResource): Promise<void> {
+    const { parsed, wantsJson } = context;
+    const exactDescription = wantsJson && !parsed.trailingSlash;
+    switch (resource.type) {
+      case "missing":
+        sendError(request, response, 404, "not found");
+        return;
+      case "symlink":
+        if (exactDescription) sendJsonDescription(request, response, { path: parsed.path, kind: "symlink" });
+        else sendError(request, response, 403, "forbidden");
+        return;
+      case "submodule":
+        if (exactDescription) sendJsonDescription(request, response, { path: parsed.path, kind: "submodule" });
+        else sendError(request, response, 404, "not found");
+        return;
+      case "file":
+        if (parsed.trailingSlash) { sendError(request, response, 404, "not found"); return; }
+        if (wantsJson) {
+          const parser = this.parserFor(parsed.path);
+          const bytes = parser === undefined ? undefined : await readBlob(context.repository.gitDir, resource.id);
+          sendJsonDescription(request, response, await this.describeRefFile(parsed.path, resource, context.commit, bytes));
+          return;
+        }
+        await sendRefFile(request, response, context, parsed.path, resource);
+        return;
+      case "dir":
+        if (wantsJson) {
+          sendJsonDescription(request, response, await this.listRefDirectory(context, resource.id));
+          return;
+        }
+        if (!parsed.trailingSlash) { redirectToDirectory(request, response, parsed); return; }
+        await this.sendRefDirectoryIndex(request, response, context, resource.id);
+        return;
+    }
+  }
+
+  private async describeRefFile(
+    path: string,
+    resource: { size: number },
+    commit: GitCommit,
+    bytes: Uint8Array | undefined,
+  ): Promise<DirectoryEntry> {
+    const defaults: DirectoryEntry = { path, kind: "file", contentType: contentTypeFor(path), size: resource.size, modified: commit.committed };
+    const parser = this.parserFor(path);
+    if (parser === undefined || bytes === undefined) return defaults;
+    return { ...defaults, ...await parseFields(parser, path, bytes) };
+  }
+
+  private async listRefDirectory(context: RefRequest, tree: string): Promise<DirectoryListing> {
+    const { parsed, repository, commit } = context;
+    const visible: Array<{ path: string; resource: GitTreeEntry["resource"] }> = [];
+    for (const { name: rawName, resource } of await listTree(repository.gitDir, tree)) {
+      let name: string;
+      try { name = utf8Decoder.decode(rawName); }
+      catch { continue; }
+      if (name.startsWith(".") || name.includes("\\")) continue;
+      const path = parsed.path === "" ? name : `${parsed.path}/${name}`;
+      if (this.ignorePatterns.hides(path, resource.type === "dir" || resource.type === "submodule")) continue;
+      visible.push({ path, resource });
+    }
+    const parsedIds = visible.flatMap(({ path, resource }) =>
+      resource.type === "file" && this.parserFor(path) !== undefined ? [resource.id] : []);
+    const blobs = await readBlobs(repository.gitDir, parsedIds);
+    const entries: DirectoryEntry[] = [];
+    for (const { path, resource } of visible) {
+      if (resource.type === "file") entries.push(await this.describeRefFile(path, resource, commit, blobs.get(resource.id)));
+      else entries.push({ path, kind: resource.type });
+    }
+    const lastSegment = (entry: DirectoryEntry): string => entry.path.slice(entry.path.lastIndexOf("/") + 1);
+    entries.sort((left, right) => lastSegment(left) < lastSegment(right) ? -1 : lastSegment(left) > lastSegment(right) ? 1 : 0);
+    return { path: parsed.path, kind: "dir", entries };
+  }
+
+  private async sendRefDirectoryIndex(request: Request, response: Response, context: RefRequest, tree: string): Promise<void> {
+    const segments = [...context.parsed.segments, "index.html"];
+    const path = segments.join("/");
+    const missingIndex = (): void => sendError(request, response, 404, "add ?json to list the directory");
+    if (this.ignorePatterns.hides(path, false)) { missingIndex(); return; }
+    const index = (await listTree(context.repository.gitDir, tree)).find(({ name }) => name.equals(Buffer.from("index.html")));
+    if (index?.resource.type === "symlink") { sendError(request, response, 403, "forbidden"); return; }
+    if (index?.resource.type !== "file") { missingIndex(); return; }
+    await sendRefFile(request, response, context, path, index.resource);
   }
 
   private parserFor(path: string): FileParser | undefined {
@@ -1067,6 +1221,22 @@ function parseRequestPath(url: string): ParsedPath | HttpError {
   return { segments, path: segments.join("/"), trailingSlash };
 }
 
+/**
+ * The `ref` query value, undefined when there is none, or a `400` when it is
+ * empty, contains a null character, or is given more than once
+ * (spec/server.md#git-refs).
+ */
+function parseRefQuery(url: string): string | undefined | HttpError {
+  const queryStart = url.indexOf("?");
+  if (queryStart === -1) return undefined;
+  const values = new URLSearchParams(url.slice(queryStart + 1)).getAll("ref");
+  if (values.length === 0) return undefined;
+  if (values.length > 1) return new HttpError(400, "give ref once");
+  const ref = values[0] as string;
+  if (ref === "" || ref.includes("\0")) return new HttpError(400, "invalid ref");
+  return ref;
+}
+
 function hasJsonQuery(url: string): boolean {
   const queryStart = url.indexOf("?");
   return queryStart !== -1 && new URLSearchParams(url.slice(queryStart + 1)).has("json");
@@ -1201,18 +1371,102 @@ async function sendFile(request: Request, response: Response, path: string): Pro
   }
 }
 
-function fileMetadata(path: string, fileStats: Stats): { contentType: string; etag: string; lastModified: string; link: string } {
-  const lookedUpType = mimeTypes.lookup(path) || "application/octet-stream";
-  const lowerType = lookedUpType.toLowerCase();
-  const contentType = lowerType.startsWith("text/") || lowerType === "application/json" || lowerType.endsWith("+json")
-    ? `${lookedUpType}; charset=utf-8`
-    : lookedUpType;
+function fileMetadata(path: string, fileStats: Stats): FileMetadata & { lastModified: string } {
   return {
-    contentType,
+    contentType: contentTypeFor(path),
     etag: `W/"${fileStats.size.toString(16)}-${fileStats.mtime.getTime().toString(16)}"`,
     lastModified: fileStats.mtime.toUTCString(),
     link: `<${encodeURIComponent(basename(path))}?json>; rel="describedby"`,
   };
+}
+
+/** The `Content-Type` of a file's bytes, from the extension of its path (spec/server.md#reading). */
+function contentTypeFor(path: string): string {
+  const lookedUpType = mimeTypes.lookup(path) || "application/octet-stream";
+  const lowerType = lookedUpType.toLowerCase();
+  return lowerType.startsWith("text/") || lowerType === "application/json" || lowerType.endsWith("+json")
+    ? `${lookedUpType}; charset=utf-8`
+    : lookedUpType;
+}
+
+/**
+ * Serves a file's bytes at a ref. The validator is the blob's object ID, a
+ * strong tag; there is no modification time, so dates are not validators
+ * (spec/server.md#git-refs).
+ */
+async function sendRefFile(
+  request: Request,
+  response: Response,
+  context: RefRequest,
+  path: string,
+  blob: { id: string; size: number },
+): Promise<void> {
+  const metadata: FileMetadata = {
+    contentType: contentTypeFor(path),
+    etag: `"${blob.id}"`,
+    link: `<${encodeURIComponent(basename(path))}?json&ref=${encodeURIComponent(context.ref)}>; rel="describedby"`,
+    ...(context.ref === context.commit.id ? { cacheControl: immutableCacheControl } : {}),
+  };
+  const ifNoneMatch = request.get("If-None-Match");
+  if (ifNoneMatch !== undefined && etagListMatches(ifNoneMatch, metadata.etag)) { sendNotModified(response, metadata); return; }
+  if (request.method === "HEAD") {
+    setFileHeaders(response, metadata, blob.size);
+    response.status(200).end();
+    return;
+  }
+
+  let range: ByteRange = { kind: "full" };
+  const rangeHeader = request.get("Range");
+  const ifRange = request.get("If-Range");
+  if (rangeHeader !== undefined && (ifRange === undefined || ifRange.trim() === metadata.etag)) {
+    range = parseRange(rangeHeader, blob.size);
+  }
+  if (range.kind === "unsatisfiable") {
+    response.set({ "Accept-Ranges": "bytes", "Content-Range": `bytes */${blob.size}`, "ETag": metadata.etag });
+    sendError(request, response, 416, "range not satisfiable");
+    return;
+  }
+  const start = range.kind === "range" ? range.start : 0;
+  const end = range.kind === "range" ? range.end : blob.size - 1;
+  setFileHeaders(response, metadata, end - start + 1);
+  if (range.kind === "range") {
+    response.set("Content-Range", `bytes ${start}-${end}/${blob.size}`);
+    response.status(206);
+  } else response.status(200);
+  if (blob.size === 0) { response.end(); return; }
+
+  const { child, exited } = streamBlob(context.repository.gitDir, blob.id);
+  try {
+    await pipeline(Readable.from(byteSlice(child.stdout, start, end)), response);
+    if (await exited !== 0) throw new GitError("git failed");
+  } catch (error) {
+    if (!response.headersSent) throw error instanceof GitError ? error : new GitError("git failed");
+    response.destroy();
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+}
+
+/** Yields bytes `start` through `end` inclusive of a stream, then stops reading it. */
+async function* byteSlice(source: AsyncIterable<Buffer>, start: number, end: number): AsyncGenerator<Buffer> {
+  let offset = 0;
+  for await (const chunk of source) {
+    const chunkStart = offset;
+    offset += chunk.length;
+    if (offset <= start) continue;
+    const from = Math.max(0, start - chunkStart);
+    const to = Math.min(chunk.length, end + 1 - chunkStart);
+    if (to > from) yield chunk.subarray(from, to);
+    if (offset > end) return;
+  }
+}
+
+/** Redirects a directory URL without its trailing slash to the slash-terminated one, keeping the query. */
+function redirectToDirectory(request: Request, response: Response, parsed: ParsedPath): void {
+  const name = parsed.segments.at(-1) as string;
+  const query = request.url.includes("?") ? request.url.slice(request.url.indexOf("?")) : "";
+  response.set("Location", `${encodeURIComponent(name)}/${query}`);
+  response.status(307).end();
 }
 
 function fileDescription(path: string, absolutePath: string, fileStats: Stats): DirectoryEntry {
@@ -1225,24 +1479,26 @@ function fileDescription(path: string, absolutePath: string, fileStats: Stats): 
   };
 }
 
-function setFileHeaders(
-  response: Response,
-  metadata: { contentType: string; etag: string; lastModified: string; link: string },
-  contentLength: number,
-): void {
+function setFileHeaders(response: Response, metadata: FileMetadata, contentLength: number): void {
   response.set({
     "Content-Type": metadata.contentType,
     "Content-Length": String(contentLength),
-    "Last-Modified": metadata.lastModified,
     "ETag": metadata.etag,
     "Accept-Ranges": "bytes",
     "Link": metadata.link,
   });
+  setOptionalFileHeaders(response, metadata);
 }
 
-function sendNotModified(response: Response, metadata: { etag: string; lastModified: string; link: string }): void {
-  response.set({ "ETag": metadata.etag, "Last-Modified": metadata.lastModified, "Link": metadata.link });
+function sendNotModified(response: Response, metadata: FileMetadata): void {
+  response.set({ "ETag": metadata.etag, "Link": metadata.link });
+  setOptionalFileHeaders(response, metadata);
   response.status(304).end();
+}
+
+function setOptionalFileHeaders(response: Response, metadata: FileMetadata): void {
+  if (metadata.lastModified !== undefined) response.set("Last-Modified", metadata.lastModified);
+  if (metadata.cacheControl !== undefined) response.set("Cache-Control", metadata.cacheControl);
 }
 
 function etagListMatches(header: string, currentEtag: string): boolean {

@@ -78,6 +78,12 @@ test("bundled skill teaches descriptions, directory URLs, and live refetch", asy
   assert.match(skill, /npm install -g @rupertsworld\/fileserver/);
   assert.match(skill, /`PATCH` without `\?json`.*`405`/s);
   assert.match(skill, /whole-file `PUT`/);
+  assert.match(skill, /`ref=<ref>`/);
+  assert.match(skill, /nearest git repository or worktree/);
+  assert.match(skill, /`PUT`, `PATCH`, and `DELETE` with `ref` return\s+`405`/);
+  assert.match(skill, /`kind: "submodule"`/);
+  assert.match(skill, /immutable/);
+  assert.match(skill, /change stream says nothing about refs/);
   assert.doesNotMatch(skill, /old_string|new_string/);
 });
 

@@ -7,7 +7,8 @@ description: Read, list, write, edit, delete, and watch files in a directory ser
 
 Make every request against the base URL you are given (`<base>`). Encode each
 path segment for URLs. The case-sensitive `json` query parameter selects a
-JSON description; its value does not matter. Other query parameters are ignored.
+JSON description; its value does not matter. The case-sensitive `ref` query
+parameter reads at a git ref (see below). Other query parameters are ignored.
 
 ## Install
 
@@ -125,6 +126,39 @@ require the stated media type (`415` otherwise); malformed JSON or a non-object 
 (`413`); `PATCH` on a file over 16 MiB is `415`. A rejected write leaves
 the old file intact and emits no change signal. If a parser cannot read
 bytes it produced, the response is `500`.
+
+## Read at a git ref
+
+Add `ref=<ref>` to a `GET` or `HEAD` to read a file, the `index.html` of a
+directory, a description (with `json` too), or a listing as it is at a git
+branch, tag, or commit rather than on disk. Build the query with
+`encodeURIComponent` or `URLSearchParams`, so a `+` in a ref arrives as `%2B`.
+Any revision git resolves to a commit works, such as `main`, `v1.2`, a full or
+abbreviated commit ID, `HEAD`, or `main~1`.
+
+- The repository is the nearest git repository or worktree enclosing the path
+  on disk, and the path is read relative to its top. In a linked worktree,
+  `HEAD` is the commit checked out in that worktree; branches and tags are
+  shared. A path need not exist on disk, only at the ref.
+- Responses have the same shapes, media types, and hidden paths as live reads.
+  The `modified` field of a file description is the date of the commit, not a
+  time for that file. Listing entries may have `kind: "submodule"`, which is
+  opaque. A symlink has only its `?json` description; other requests to or
+  through it return `403`.
+- Byte responses carry a strong `ETag` (the git ID of the file content) and no
+  `Last-Modified`. Revalidate with `If-None-Match`, and send that `ETag` as
+  `If-Range` for ranges. Their `Link` names the description at the same ref.
+  When `ref` is the full commit ID, responses carry
+  `Cache-Control: max-age=31536000, immutable`, so the content can be cached
+  for good; a branch can move, so fetch it again to see new commits.
+- Reads at a ref are read-only: `PUT`, `PATCH`, and `DELETE` with `ref` return
+  `405` with `Allow: GET, HEAD, OPTIONS`.
+- An unknown ref, a path outside any repository, and a path absent at the ref
+  each return `404`; an empty or repeated `ref` returns `400`; a failure
+  running git returns `500`.
+- The change stream says nothing about refs. A commit or branch update
+  produces no signal for the branch, so a view of a branch refetches when it
+  needs to see it move.
 
 ## Follow live changes
 
